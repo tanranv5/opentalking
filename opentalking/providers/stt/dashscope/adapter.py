@@ -32,11 +32,13 @@ class _NoopRecognitionCallback(RecognitionCallback):
 class _StreamingTextCollector(RecognitionCallback):
     """流式识别：汇总 ``sentence_end`` 分句；否则保留最后一次部分文本。"""
 
-    def __init__(self) -> None:
+    def __init__(self, event_queue: "queue.Queue[dict] | None" = None) -> None:
         self._segments: list[str] = []
         self._last_partial = ""
         self._lock = threading.Lock()
         self.error_message: str | None = None
+        self._event_queue = event_queue
+        self._last_emitted_partial = ""
 
     def on_event(self, result: RecognitionResult) -> None:
         with self._lock:
@@ -49,20 +51,40 @@ class _StreamingTextCollector(RecognitionCallback):
                         and item.get("sentence_end")
                         and item.get("text")
                     ):
-                        self._segments.append(str(item["text"]).strip())
+                        text = str(item["text"]).strip()
+                        self._segments.append(text)
+                        self._emit("transcript.final", text, True)
                         pushed = True
             if not pushed:
                 t = recognition_result_to_text(result)
                 if t:
                     self._last_partial = t
+                    self._emit("transcript.partial", t, False)
 
     def on_error(self, result: RecognitionResult) -> None:
         self.error_message = getattr(result, "message", None) or str(result)
+        self._emit("error", self.error_message, True)
 
     def combined_text(self) -> str:
         with self._lock:
             merged = "".join(self._segments).strip()
             return merged if merged else self._last_partial.strip()
+
+    def _emit(self, event_type: str, text: str | None, is_final: bool) -> None:
+        if self._event_queue is None:
+            return
+        payload = (text or "").strip()
+        if not payload:
+            return
+        if not is_final and payload == self._last_emitted_partial:
+            return
+        if not is_final:
+            self._last_emitted_partial = payload
+        self._event_queue.put({
+            "type": event_type,
+            "text": payload,
+            "is_final": is_final,
+        })
 
 
 def _dashscope_api_key() -> str:
@@ -248,7 +270,11 @@ def _recognize_wav_sync(wav_path: Path) -> tuple[str, float]:
     return text, call_ms
 
 
-def transcribe_pcm_chunk_queue_sync(chunk_queue: "queue.Queue[bytes | None]") -> tuple[str, float]:
+def transcribe_pcm_chunk_queue_sync(
+    chunk_queue: "queue.Queue[bytes | None]",
+    *,
+    event_queue: "queue.Queue[dict] | None" = None,
+) -> tuple[str, float]:
     """PCM s16le mono 16kHz 分块流式识别。
 
     ``chunk_queue`` 中依次放入音频 ``bytes``；放入 ``None`` 表示本段音频已结束，
@@ -268,7 +294,7 @@ def transcribe_pcm_chunk_queue_sync(chunk_queue: "queue.Queue[bytes | None]") ->
     if hints:
         kwargs["language_hints"] = hints
 
-    collector = _StreamingTextCollector()
+    collector = _StreamingTextCollector(event_queue)
     model = _stt_model()
     rc = Recognition(
         model=model,

@@ -519,6 +519,7 @@ def transcribe_pcm_chunk_queue_sync(
     *,
     sample_rate: int = 16000,
     provider: str | None = None,
+    event_queue: "queue.Queue[dict] | None" = None,
 ) -> tuple[str, float]:
     selected = normalize_stt_provider(provider, default=None) or _provider()
     if selected == "dashscope":
@@ -526,7 +527,7 @@ def transcribe_pcm_chunk_queue_sync(
             transcribe_pcm_chunk_queue_sync as dashscope_transcribe_pcm_chunk_queue_sync,
         )
 
-        return dashscope_transcribe_pcm_chunk_queue_sync(chunk_queue)
+        return dashscope_transcribe_pcm_chunk_queue_sync(chunk_queue, event_queue=event_queue)
 
     adapter = create_stt_adapter(selected)
     if adapter is None:

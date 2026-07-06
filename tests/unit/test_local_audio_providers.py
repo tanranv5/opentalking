@@ -1201,7 +1201,7 @@ def test_stt_factory_request_provider_override_routes_dashscope(monkeypatch):
         wav_calls.append(path)
         return "API识别文本", 22.0
 
-    def fake_transcribe_pcm(chunk_queue):
+    def fake_transcribe_pcm(chunk_queue, event_queue=None):
         pcm_calls.append(chunk_queue)
         while chunk_queue.get() is not None:
             pass
