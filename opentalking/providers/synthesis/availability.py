@@ -123,16 +123,33 @@ async def _is_direct_ws_reachable(url: str) -> bool:
             return False
 
 
-async def _is_flashhead_http_reachable(base_url: str) -> bool:
-    base_url = base_url.strip().rstrip("/")
-    if not base_url:
+async def _is_flashhead_realtime_reachable(url: str) -> bool:
+    parts = urlsplit(url)
+    if parts.scheme.lower() not in {"ws", "wss"} or not parts.hostname:
         return False
+    try:
+        from websockets.asyncio.client import connect as ws_connect
+    except Exception:
+        return False
+    try:
+        async with ws_connect(url, open_timeout=1.0, close_timeout=1.0, max_size=1024):
+            return True
+    except Exception:
+        return False
+
+
+async def _is_flashhead_http_reachable(base_url: str) -> bool:
+    base_url = base_url.strip().rstrip("/") or "http://localhost:8766"
     try:
         async with httpx.AsyncClient(timeout=1.0) as client:
             response = await client.get(f"{base_url}/health")
             return response.status_code < 500
     except Exception:
         return False
+
+
+def _flashhead_http_base_url(settings) -> str:
+    return str(getattr(settings, "flashhead_base_url", "") or "http://localhost:8766").strip()
 
 
 async def resolve_model_statuses(settings) -> list[ModelStatus]:
@@ -161,9 +178,13 @@ async def resolve_model_statuses(settings) -> list[ModelStatus]:
                 reason = "not_configured"
         elif resolved.backend == "direct_ws":
             if model == "flashhead":
-                base_url = str(getattr(settings, "flashhead_base_url", "") or "").strip()
-                connected = await _is_flashhead_http_reachable(base_url)
-                reason = "flashhead_http" if connected else "flashhead_http_unavailable"
+                if resolved.ws_url:
+                    connected = await _is_flashhead_realtime_reachable(resolved.ws_url)
+                    reason = "flashhead_ws" if connected else "flashhead_ws_unavailable"
+                else:
+                    base_url = _flashhead_http_base_url(settings)
+                    connected = await _is_flashhead_http_reachable(base_url)
+                    reason = "flashhead_http" if connected else "flashhead_http_unavailable"
             elif resolved.ws_url:
                 connected = await _is_direct_ws_reachable(resolved.ws_url)
                 reason = "direct_ws" if connected else "direct_ws_unavailable"

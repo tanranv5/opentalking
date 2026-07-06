@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -13,6 +15,14 @@ from opentalking.providers.synthesis.availability import (
     _fetch_omnirt_audio2video_models,
     resolve_model_statuses,
 )
+
+
+@pytest.fixture(autouse=True)
+def _disable_flashhead_http_probe(monkeypatch) -> None:
+    async def fake_reachable(_base_url: str) -> bool:
+        return False
+
+    monkeypatch.setattr("opentalking.providers.synthesis.availability._is_flashhead_http_reachable", fake_reachable, raising=False)
 
 
 def _write_quicktalk_local_assets(asset_root) -> None:
@@ -326,7 +336,7 @@ async def test_direct_ws_status_requires_reachable_url(monkeypatch) -> None:
         return False
 
     monkeypatch.setattr(
-        "opentalking.providers.synthesis.availability._is_direct_ws_reachable",
+        "opentalking.providers.synthesis.availability._is_flashhead_realtime_reachable",
         fake_reachable,
     )
 
@@ -340,7 +350,7 @@ async def test_direct_ws_status_requires_reachable_url(monkeypatch) -> None:
 
     assert statuses["flashhead"].backend == "direct_ws"
     assert statuses["flashhead"].connected is False
-    assert statuses["flashhead"].reason == "direct_ws_unavailable"
+    assert statuses["flashhead"].reason == "flashhead_ws_unavailable"
 
 
 async def test_direct_ws_status_reports_reachable_url(monkeypatch) -> None:
@@ -348,7 +358,7 @@ async def test_direct_ws_status_reports_reachable_url(monkeypatch) -> None:
         return True
 
     monkeypatch.setattr(
-        "opentalking.providers.synthesis.availability._is_direct_ws_reachable",
+        "opentalking.providers.synthesis.availability._is_flashhead_realtime_reachable",
         fake_reachable,
     )
 
@@ -362,7 +372,34 @@ async def test_direct_ws_status_reports_reachable_url(monkeypatch) -> None:
 
     assert statuses["flashhead"].backend == "direct_ws"
     assert statuses["flashhead"].connected is True
-    assert statuses["flashhead"].reason == "direct_ws"
+    assert statuses["flashhead"].reason == "flashhead_ws"
+
+
+async def test_flashhead_status_uses_http_when_ws_url_is_unset(monkeypatch) -> None:
+    seen: dict[str, str] = {}
+
+    async def fake_reachable(base_url: str) -> bool:
+        seen["base_url"] = base_url
+        return True
+
+    monkeypatch.setattr(
+        "opentalking.providers.synthesis.availability._is_flashhead_http_reachable",
+        fake_reachable,
+    )
+
+    settings = SimpleNamespace(
+        omnirt_endpoint="",
+        flashtalk_ws_url="",
+        flashhead_ws_url="",
+        flashhead_base_url="http://127.0.0.1:8766",
+    )
+
+    statuses = {status.id: status for status in await resolve_model_statuses(settings)}
+
+    assert seen["base_url"] == "http://127.0.0.1:8766"
+    assert statuses["flashhead"].backend == "direct_ws"
+    assert statuses["flashhead"].connected is True
+    assert statuses["flashhead"].reason == "flashhead_http"
 
 
 async def test_omnirt_status_falls_back_to_legacy_avatar_models_path(monkeypatch) -> None:

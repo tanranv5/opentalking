@@ -262,22 +262,41 @@ def _create_runner(
             audio2video_client = OmniRTAudio2VideoClient(MockFlashTalkClient())
             effective_model = "mock"
         elif model == "flashhead":
-            from opentalking.providers.synthesis.flashhead import FlashHeadWSClient
+            from opentalking.providers.synthesis.flashhead import FlashHeadHTTPClient, FlashHeadWSClient
 
-            audio2video_client = OmniRTAudio2VideoClient(
-                FlashHeadWSClient(
-                    ws_url=backend.ws_url or settings.flashhead_ws_url,
+            flashhead_ws_url = str(backend.ws_url or settings.flashhead_ws_url or "").strip()
+            flashhead_config = {
+                "fps": int(settings.flashhead_fps),
+                "sample_rate": int(settings.flashhead_sample_rate),
+                "width": int(settings.flashhead_width),
+                "height": int(settings.flashhead_height),
+                "frame_num": int(settings.flashhead_frame_num),
+                "chunk_samples": int(settings.flashhead_chunk_samples),
+            }
+            if flashhead_ws_url:
+                flashhead_client = FlashHeadWSClient(
+                    ws_url=flashhead_ws_url,
                     model=settings.flashhead_model,
-                    config={
-                        "fps": int(settings.flashhead_fps),
-                        "sample_rate": int(settings.flashhead_sample_rate),
-                        "width": int(settings.flashhead_width),
-                        "height": int(settings.flashhead_height),
-                        "frame_num": int(settings.flashhead_frame_num),
-                        "chunk_samples": int(settings.flashhead_chunk_samples),
-                    },
+                    config=flashhead_config,
                 )
-            )
+            else:
+                flashhead_client = FlashHeadHTTPClient(
+                    base_url=str(settings.flashhead_base_url or "http://localhost:8766"),
+                    model=settings.flashhead_model,
+                    shared_local_dir=str(settings.flashhead_shared_local_dir),
+                    shared_remote_dir=str(settings.flashhead_shared_remote_dir),
+                    output_local_dir=str(settings.flashhead_output_local_dir),
+                    output_remote_dir=str(settings.flashhead_output_remote_dir),
+                    output_base_url=str(settings.flashhead_output_base_url),
+                    timeout_sec=float(settings.flashhead_timeout_sec),
+                    fps=flashhead_config["fps"],
+                    sample_rate=flashhead_config["sample_rate"],
+                    width=flashhead_config["width"],
+                    height=flashhead_config["height"],
+                    frame_num=flashhead_config["frame_num"],
+                    chunk_samples=flashhead_config["chunk_samples"],
+                )
+            audio2video_client = OmniRTAudio2VideoClient(flashhead_client)
             effective_model = "flashhead"
         elif backend.backend in {"omnirt", "direct_ws"}:
             from opentalking.providers.synthesis.omnirt import auth_headers as omnirt_auth_headers
