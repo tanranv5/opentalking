@@ -692,8 +692,8 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Create
         settings = request.app.state.settings
 
         if uses_flashtalk_slot:
-            from opentalking.runtime.task_consumer import slot_is_occupied
-            if slot_is_occupied():
+            from opentalking.runtime.task_consumer import slot_has_capacity, slot_queue_size
+            if slot_queue_size() > 0 or not slot_has_capacity():
                 # Slot busy: return immediately, client waits via SSE session.queued
                 return CreateSessionResponse(session_id=sid, status="queued")
             else:
@@ -749,7 +749,8 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Create
             )
     elif uses_flashtalk_slot:
         qs = await get_flashtalk_queue_status(r)
-        if qs["slot_occupied"] or qs["queue_size"] > 0:
+        slots_available = int(qs.get("slots_available", 0) or 0)
+        if slots_available <= 0 or qs["queue_size"] > 0:
             return CreateSessionResponse(session_id=sid, status="queued")
         if await _wait_for_session_worker_ready(r, sid, max_wait_sec=3.0):
             return CreateSessionResponse(session_id=sid, status="created")

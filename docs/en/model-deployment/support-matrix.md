@@ -63,7 +63,7 @@ Use it as the decision page before following the deeper setup guides.
 | `quicktalk + omnirt` | Retained as a compatible service-hosted path; prefer `quicktalk + local` for single-machine deployment. |
 | `fasterliveportrait + omnirt` | The FasterLivePortrait guide covers JoyVASA/chinese-hubert-base checkpoints, TensorRT startup, `/v1/audio2video/fasterliveportrait`, frontend controls, and hot updates. |
 | `flashtalk + omnirt` | Documented startup scripts, legacy fallback behavior, and README validation notes for Ascend 910B2 x8. |
-| `flashhead + direct_ws` | Configured integration path plus the `/models` `reason=direct_ws` example in the talking-head guide. |
+| `flashhead + direct_ws` | Configured integration path plus the `/models` `reason=flashhead_ws` example in the talking-head guide. |
 
 ## Recommended First Paths
 

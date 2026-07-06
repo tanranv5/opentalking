@@ -612,6 +612,8 @@ class Settings(BaseSettings):
 
     # FlashTalk slot queue: max sessions waiting behind the active one (0 = unlimited)
     flashtalk_max_queue_size: int = 3
+    # Number of concurrent FlashTalk/FlashHead sessions allowed (1 = legacy single slot)
+    flashtalk_slot_capacity: int = 1
     # Seconds a session may wait in queue before being rejected (0 = no timeout)
     flashtalk_slot_timeout_sec: int = 3600
     # Max seconds a single session may hold the FlashTalk slot (0 = unlimited)

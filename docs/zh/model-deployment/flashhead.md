@@ -56,7 +56,7 @@ curl -s http://127.0.0.1:8000/models | python3 -m json.tool
 配置 WebSocket URL 后，期望：
 
 ```json
-{"id":"flashhead","backend":"direct_ws","connected":true,"reason":"direct_ws"}
+{"id":"flashhead","backend":"direct_ws","connected":true,"reason":"flashhead_ws"}
 ```
 
 ## 常见错误

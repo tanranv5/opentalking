@@ -1081,6 +1081,10 @@ def test_queue_status_reads_shared_redis_state() -> None:
         "slot_occupied": True,
         "queue_size": 2,
         "active_session_id": "",
+        "active_session_ids": [],
+        "active_count": 1,
+        "slot_capacity": 1,
+        "slots_available": 0,
         "queued_session_ids": [],
     }
 

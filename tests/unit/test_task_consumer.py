@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from apps.api.services import session_service
+from opentalking.core.queue_status import get_flashtalk_queue_status
 from opentalking.core.config import get_settings
 from opentalking.core.in_memory_redis import InMemoryRedis
 from opentalking.core.redis_keys import TASK_QUEUE
@@ -50,6 +51,12 @@ class StubRunner:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class SlowCloseRunner(StubRunner):
+    async def close(self) -> None:
+        self.closed = True
+        self._closed = True
 
 
 class UploadedPcmRunner(StubRunner):
@@ -999,9 +1006,14 @@ async def test_handle_worker_task_flashtalk_init_marks_worker_ready(
         return runner
 
     monkeypatch.setattr(task_consumer, "_create_runner", fake_create_runner)
-    monkeypatch.setattr(task_consumer, "_flashtalk_slot_lock", None)
+    monkeypatch.setattr(task_consumer, "_flashtalk_slot_state_lock", None)
+    monkeypatch.setattr(task_consumer, "_flashtalk_slot_semaphore", None)
+    monkeypatch.setattr(task_consumer, "_flashtalk_slot_capacity", 1)
     monkeypatch.setattr(task_consumer, "_slot_queue_size", 0)
     monkeypatch.setattr(task_consumer, "_queued_tasks", {})
+    monkeypatch.setattr(task_consumer, "_queued_session_ids", [])
+    monkeypatch.setattr(task_consumer, "_flashtalk_active_session_ids", [])
+    monkeypatch.setattr(task_consumer, "_flashtalk_active_session_id", None)
 
     redis = InMemoryRedis()
     sid = "sess_flashtalk_ready"
@@ -1029,3 +1041,192 @@ async def test_handle_worker_task_flashtalk_init_marks_worker_ready(
 
     await handle_worker_task({"cmd": "close", "session_id": sid}, redis, Path("."), "cpu", runners)
     await asyncio.sleep(0.6)
+
+
+@pytest.mark.asyncio
+async def test_handle_worker_task_allows_multiple_flashhead_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_create_runner(task: dict[str, object], *_args: object, **_kwargs: object) -> SlowCloseRunner:
+        runner = SlowCloseRunner()
+        return runner
+
+    monkeypatch.setattr(task_consumer, "_create_runner", fake_create_runner)
+    monkeypatch.setattr(task_consumer, "_flashtalk_slot_state_lock", None)
+    monkeypatch.setattr(task_consumer, "_flashtalk_slot_semaphore", None)
+    monkeypatch.setattr(task_consumer, "_flashtalk_slot_capacity", 1)
+    monkeypatch.setattr(task_consumer, "_slot_queue_size", 0)
+    monkeypatch.setattr(task_consumer, "_queued_tasks", {})
+    monkeypatch.setattr(task_consumer, "_queued_session_ids", [])
+    monkeypatch.setattr(task_consumer, "_flashtalk_active_session_ids", [])
+    monkeypatch.setattr(task_consumer, "_flashtalk_active_session_id", None)
+    monkeypatch.setattr(
+        task_consumer,
+        "get_settings",
+        lambda: SimpleNamespace(
+            flashtalk_max_queue_size=3,
+            flashtalk_slot_timeout_sec=5,
+            flashtalk_max_session_sec=0,
+            flashtalk_slot_capacity=2,
+        ),
+    )
+
+    redis = InMemoryRedis()
+    runners: dict[str, SlowCloseRunner] = {}
+    for sid in ("sess_flashhead_a", "sess_flashhead_b"):
+        await redis.hset(session_key(sid), mapping={"session_id": sid, "state": "created", "model": "flashhead"})
+        await handle_worker_task(
+            {"cmd": "init", "session_id": sid, "avatar_id": "singer", "model": "flashhead"},
+            redis,
+            Path("."),
+            "cpu",
+            runners,
+        )
+
+    for _ in range(100):
+        if {"sess_flashhead_a", "sess_flashhead_b"} <= runners.keys():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("FlashHead sessions did not acquire both configured slots")
+
+    status = await get_flashtalk_queue_status(redis)
+    assert status["active_session_ids"] == ["sess_flashhead_a", "sess_flashhead_b"]
+    assert status["active_count"] == 2
+    assert status["slot_capacity"] == 2
+    assert status["slots_available"] == 0
+    assert status["queue_size"] == 0
+
+    for sid in ("sess_flashhead_a", "sess_flashhead_b"):
+        await handle_worker_task({"cmd": "close", "session_id": sid}, redis, Path("."), "cpu", runners)
+    await asyncio.sleep(0.6)
+
+
+@pytest.mark.asyncio
+async def test_handle_worker_task_cancels_flashhead_init_before_queue_task_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_create_runner(*_args: object, **_kwargs: object) -> StubRunner:
+        return StubRunner()
+
+    monkeypatch.setattr(task_consumer, "_create_runner", fake_create_runner)
+    monkeypatch.setattr(task_consumer, "_flashtalk_slot_state_lock", None)
+    monkeypatch.setattr(task_consumer, "_flashtalk_slot_semaphore", None)
+    monkeypatch.setattr(task_consumer, "_flashtalk_slot_capacity", 1)
+    monkeypatch.setattr(task_consumer, "_slot_queue_size", 0)
+    monkeypatch.setattr(task_consumer, "_queued_tasks", {})
+    monkeypatch.setattr(task_consumer, "_queued_session_ids", [])
+    monkeypatch.setattr(task_consumer, "_flashtalk_active_session_ids", [])
+    monkeypatch.setattr(task_consumer, "_flashtalk_active_session_id", None)
+    monkeypatch.setattr(
+        task_consumer,
+        "get_settings",
+        lambda: SimpleNamespace(
+            flashtalk_max_queue_size=3,
+            flashtalk_slot_timeout_sec=5,
+            flashtalk_max_session_sec=0,
+            flashtalk_slot_capacity=1,
+        ),
+    )
+
+    redis = InMemoryRedis()
+    sid = "sess_flashhead_cancel_before_wait"
+    await redis.hset(session_key(sid), mapping={"session_id": sid, "state": "created", "model": "flashhead"})
+    runners: dict[str, StubRunner] = {}
+
+    await handle_worker_task(
+        {"cmd": "init", "session_id": sid, "avatar_id": "singer", "model": "flashhead"},
+        redis,
+        Path("."),
+        "cpu",
+        runners,
+    )
+    await handle_worker_task({"cmd": "close", "session_id": sid}, redis, Path("."), "cpu", runners)
+    await asyncio.sleep(0.1)
+
+    assert sid not in runners
+    status = await get_flashtalk_queue_status(redis)
+    assert status["queue_size"] == 0
+    assert status["active_session_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_slot_returns_false_when_active_count_reaches_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingSemaphore:
+        def locked(self) -> bool:
+            return False
+
+        async def acquire(self) -> None:
+            await asyncio.sleep(60)
+
+    monkeypatch.setattr(task_consumer, "_flashtalk_slot_state_lock", None)
+    monkeypatch.setattr(task_consumer, "_flashtalk_active_session_ids", ["sess_active"])
+    monkeypatch.setattr(task_consumer, "_flashtalk_active_session_id", "sess_active")
+
+    acquired = await asyncio.wait_for(
+        task_consumer._try_acquire_slot(BlockingSemaphore(), "sess_waiting", 1),
+        timeout=0.05,
+    )
+
+    assert acquired is False
+    assert task_consumer._flashtalk_active_session_ids == ["sess_active"]
+
+
+@pytest.mark.asyncio
+async def test_handle_worker_task_cleans_queue_when_cancelled_before_wait_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sync_started = asyncio.Event()
+    sync_calls = 0
+
+    async def blocking_sync(_redis: object) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            sync_started.set()
+            await asyncio.sleep(60)
+
+    monkeypatch.setattr(task_consumer, "_create_runner", lambda *_args, **_kwargs: StubRunner())
+    monkeypatch.setattr(task_consumer, "_sync_slot_status", blocking_sync)
+    monkeypatch.setattr(task_consumer, "_flashtalk_slot_state_lock", None)
+    monkeypatch.setattr(task_consumer, "_flashtalk_slot_semaphore", None)
+    monkeypatch.setattr(task_consumer, "_flashtalk_slot_capacity", 1)
+    monkeypatch.setattr(task_consumer, "_slot_queue_size", 0)
+    monkeypatch.setattr(task_consumer, "_queued_tasks", {})
+    monkeypatch.setattr(task_consumer, "_queued_session_ids", [])
+    monkeypatch.setattr(task_consumer, "_flashtalk_active_session_ids", [])
+    monkeypatch.setattr(task_consumer, "_flashtalk_active_session_id", None)
+    monkeypatch.setattr(
+        task_consumer,
+        "get_settings",
+        lambda: SimpleNamespace(
+            flashtalk_max_queue_size=3,
+            flashtalk_slot_timeout_sec=5,
+            flashtalk_max_session_sec=0,
+            flashtalk_slot_capacity=1,
+        ),
+    )
+
+    redis = InMemoryRedis()
+    sid = "sess_flashhead_cancel_during_sync"
+    await redis.hset(session_key(sid), mapping={"session_id": sid, "state": "created", "model": "flashhead"})
+    runners: dict[str, StubRunner] = {}
+
+    await handle_worker_task(
+        {"cmd": "init", "session_id": sid, "avatar_id": "singer", "model": "flashhead"},
+        redis,
+        Path("."),
+        "cpu",
+        runners,
+    )
+    await asyncio.wait_for(sync_started.wait(), timeout=1.0)
+
+    await handle_worker_task({"cmd": "close", "session_id": sid}, redis, Path("."), "cpu", runners)
+    await asyncio.sleep(0)
+
+    assert task_consumer._slot_queue_size == 0
+    assert task_consumer._queued_session_ids == []
+    assert task_consumer._flashtalk_active_session_ids == []
+    assert sid not in runners

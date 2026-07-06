@@ -33,24 +33,44 @@ log = logging.getLogger(__name__)
 AnyRunner = Any
 
 # ---------------------------------------------------------------------------
-# FlashTalk single-slot scheduler
-# One asyncio.Lock guards the single FlashTalk inference slot.
+# FlashTalk slot scheduler
+# One asyncio.Semaphore guards one or more FlashTalk/FlashHead inference slots.
 # _slot_queue_size tracks how many sessions are waiting (not yet holding the lock).
 # _queued_tasks tracks background tasks for sessions still waiting in queue,
 # so they can be cancelled when the session is deleted before getting the slot.
 # ---------------------------------------------------------------------------
-_flashtalk_slot_lock: asyncio.Lock | None = None
+_flashtalk_slot_state_lock: asyncio.Lock | None = None
+_flashtalk_slot_semaphore: asyncio.Semaphore | None = None
+_flashtalk_slot_capacity: int = 1
 _slot_queue_size: int = 0
 _queued_tasks: dict[str, asyncio.Task] = {}  # sid -> queued background task
 _queued_session_ids: list[str] = []
+_flashtalk_active_session_ids: list[str] = []
 _flashtalk_active_session_id: str | None = None
 
 
-def _get_slot_lock() -> asyncio.Lock:
-    global _flashtalk_slot_lock
-    if _flashtalk_slot_lock is None:
-        _flashtalk_slot_lock = asyncio.Lock()
-    return _flashtalk_slot_lock
+def _get_slot_state_lock() -> asyncio.Lock:
+    global _flashtalk_slot_state_lock
+    if _flashtalk_slot_state_lock is None:
+        _flashtalk_slot_state_lock = asyncio.Lock()
+    return _flashtalk_slot_state_lock
+
+
+def _configured_slot_capacity(settings: Any) -> int:
+    try:
+        return max(1, int(getattr(settings, "flashtalk_slot_capacity", 1) or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _get_slot_semaphore(capacity: int) -> asyncio.Semaphore:
+    global _flashtalk_slot_capacity, _flashtalk_slot_semaphore
+    capacity = max(1, int(capacity))
+    can_rebuild = not _flashtalk_active_session_ids and _slot_queue_size == 0
+    if _flashtalk_slot_semaphore is None or (capacity != _flashtalk_slot_capacity and can_rebuild):
+        _flashtalk_slot_semaphore = asyncio.Semaphore(capacity)
+        _flashtalk_slot_capacity = capacity
+    return _flashtalk_slot_semaphore
 
 
 def slot_queue_size() -> int:
@@ -59,9 +79,28 @@ def slot_queue_size() -> int:
 
 
 def slot_is_occupied() -> bool:
-    """Return True if a session currently holds the FlashTalk slot."""
-    lock = _flashtalk_slot_lock
-    return lock is not None and lock.locked()
+    """Return True if any session currently holds a FlashTalk slot."""
+    return bool(_flashtalk_active_session_ids)
+
+
+def slot_has_capacity() -> bool:
+    """Return True if at least one FlashTalk slot can be acquired now."""
+    semaphore = _flashtalk_slot_semaphore
+    if semaphore is None:
+        return True
+    return len(_active_session_ids_snapshot()) < _flashtalk_slot_capacity and not semaphore.locked()
+
+
+async def _try_acquire_slot(semaphore: asyncio.Semaphore, sid: str, capacity: int) -> bool:
+    async with _get_slot_state_lock():
+        if len(_active_session_ids_snapshot()) >= max(1, int(capacity)):
+            return False
+        if semaphore.locked():
+            return False
+        await semaphore.acquire()
+        _drop_queued_session_unlocked(sid)
+        _remember_active_session(sid)
+        return True
 
 
 def _queued_session_ids_snapshot() -> list[str]:
@@ -78,13 +117,51 @@ def _forget_queued_session(sid: str) -> None:
         _queued_session_ids.remove(sid)
 
 
+def _drop_queued_session_unlocked(sid: str) -> bool:
+    was_queued = sid in _queued_session_ids
+    if was_queued:
+        _slot_queue_size_dec()
+    _queued_tasks.pop(sid, None)
+    _forget_queued_session(sid)
+    return was_queued
+
+
+async def _drop_queued_session(sid: str) -> bool:
+    async with _get_slot_state_lock():
+        return _drop_queued_session_unlocked(sid)
+
+
+def _active_session_ids_snapshot() -> list[str]:
+    return [sid for sid in _flashtalk_active_session_ids if sid]
+
+
+def _remember_active_session(sid: str) -> None:
+    global _flashtalk_active_session_id
+    if sid and sid not in _flashtalk_active_session_ids:
+        _flashtalk_active_session_ids.append(sid)
+    active_ids = _active_session_ids_snapshot()
+    _flashtalk_active_session_id = active_ids[0] if active_ids else None
+
+
+def _forget_active_session(sid: str) -> None:
+    global _flashtalk_active_session_id
+    while sid in _flashtalk_active_session_ids:
+        _flashtalk_active_session_ids.remove(sid)
+    active_ids = _active_session_ids_snapshot()
+    _flashtalk_active_session_id = active_ids[0] if active_ids else None
+
+
 async def _sync_slot_status(r: Any) -> None:
+    active_ids = _active_session_ids_snapshot()
     try:
         await set_flashtalk_queue_status(
             r,
             slot_occupied=slot_is_occupied(),
             queue_size=slot_queue_size(),
-            active_session_id=_flashtalk_active_session_id or "",
+            active_session_id=active_ids[0] if active_ids else "",
+            active_session_ids=active_ids,
+            active_count=len(active_ids),
+            slot_capacity=_flashtalk_slot_capacity,
             queued_session_ids=_queued_session_ids_snapshot(),
         )
     except Exception:
@@ -401,103 +478,115 @@ async def _init_flashtalk_with_queue(
     runners: dict[str, AnyRunner],
     sid: str,
 ) -> None:
-    """Serialise FlashTalk sessions through a single slot lock with bounded queue.
+    """Serialise FlashTalk sessions through one or more configured slots.
 
-    The lock is held for the entire session lifetime (until runner is closed/removed),
-    not just during init — so only one FlashTalk session is active at a time.
+    Each slot is held for the entire session lifetime (until runner is closed/removed),
+    not just during init.  The default capacity is 1, matching the legacy behavior.
     Uses a manual cancellation flag instead of asyncio.wait_for to avoid
-    forcibly cancelling the lock and corrupting queue state.
+    forcibly cancelling the semaphore and corrupting queue state.
     """
     global _slot_queue_size, _queued_tasks, _flashtalk_active_session_id
     settings = get_settings()
     max_queue = settings.flashtalk_max_queue_size
     timeout_sec = settings.flashtalk_slot_timeout_sec or None
-    lock = _get_slot_lock()
+    capacity = _configured_slot_capacity(settings)
+    semaphore = _get_slot_semaphore(capacity)
 
     # Reject immediately when queue is full
-    if lock.locked() and max_queue > 0 and _slot_queue_size >= max_queue:
+    async with _get_slot_state_lock():
+        queue_full = semaphore.locked() and max_queue > 0 and _slot_queue_size >= max_queue
+        if not queue_full:
+            _slot_queue_size += 1
+            _remember_queued_session(sid)
+            position = _slot_queue_size
+
+    if queue_full:
         log.warning("FlashTalk slot queue full (%d), rejecting session %s", max_queue, sid)
+        _queued_tasks.pop(sid, None)
         await set_session_state(r, sid, "error")
         await publish_event(r, sid, "session.queued", {
             "session_id": sid, "position": -1, "message": "queue_full",
         })
         return
 
-    _slot_queue_size += 1
-    _remember_queued_session(sid)
-    position = _slot_queue_size
-    await _sync_slot_status(r)
     cancelled = False  # set to True when session is deleted while waiting
     deadline = (asyncio.get_event_loop().time() + timeout_sec) if timeout_sec else None
 
-    log.info("FlashTalk slot: session %s queued at position %d", sid, position)
-    await publish_event(r, sid, "session.queued", {
-        "session_id": sid, "position": position, "message": "waiting",
-    })
+    try:
+        await _sync_slot_status(r)
 
-    async def _run_with_lock() -> None:
+        log.info("FlashTalk slot: session %s queued at position %d", sid, position)
+        await publish_event(r, sid, "session.queued", {
+            "session_id": sid, "position": position, "message": "waiting",
+        })
+    except asyncio.CancelledError:
+        if await _drop_queued_session(sid):
+            await _sync_slot_status(r)
+        log.info("FlashTalk queued session %s cancelled before wait loop", sid)
+        raise
+
+    async def _run_with_slot() -> bool:
         nonlocal cancelled
         global _slot_queue_size, _flashtalk_active_session_id
         acquired = False
         try:
-            async with lock:
-                acquired = True
-                _slot_queue_size -= 1
-                _queued_tasks.pop(sid, None)
-                _forget_queued_session(sid)
-                _flashtalk_active_session_id = sid
-                await _sync_slot_status(r)
+            acquired = await _try_acquire_slot(semaphore, sid, capacity)
+            if not acquired:
+                return False
+            await _sync_slot_status(r)
 
-                if cancelled:
-                    log.info("FlashTalk slot: session %s was cancelled while waiting, skipping", sid)
-                    return
+            if cancelled:
+                log.info("FlashTalk slot: session %s was cancelled while waiting, skipping", sid)
+                return True
 
-                log.info("FlashTalk slot acquired by session %s", sid)
-                await _do_init(task, r, avatars_root, device, runners, sid)
-                # Notify after init so the SSE connection is already established
-                await publish_event(r, sid, "session.queued", {
-                    "session_id": sid, "position": 0, "message": "slot_acquired",
-                })
+            log.info("FlashTalk slot acquired by session %s", sid)
+            await _do_init(task, r, avatars_root, device, runners, sid)
+            # Notify after init so the SSE connection is already established
+            await publish_event(r, sid, "session.queued", {
+                "session_id": sid, "position": 0, "message": "slot_acquired",
+            })
 
-                # Hold the lock for the entire session lifetime.
-                max_session_sec = settings.flashtalk_max_session_sec
-                session_deadline = (
-                    asyncio.get_event_loop().time() + max_session_sec
-                ) if max_session_sec else None
-                warning_sent = False
-                while sid in runners:
-                    runner = runners.get(sid)
-                    # WebRTC auto-close: runner.close() sets _closed=True
-                    if runner is not None and getattr(runner, "_closed", False):
-                        log.info("Session %s self-closed (WebRTC disconnect), releasing slot", sid)
+            # Hold the slot for the entire session lifetime.
+            max_session_sec = settings.flashtalk_max_session_sec
+            session_deadline = (
+                asyncio.get_event_loop().time() + max_session_sec
+            ) if max_session_sec else None
+            warning_sent = False
+            while sid in runners:
+                runner = runners.get(sid)
+                # WebRTC auto-close: runner.close() sets _closed=True
+                if runner is not None and getattr(runner, "_closed", False):
+                    log.info("Session %s self-closed (WebRTC disconnect), releasing slot", sid)
+                    runners.pop(sid, None)
+                    break
+                # Max session duration: warn at 60s remaining, then force close
+                if session_deadline:
+                    remaining = session_deadline - asyncio.get_event_loop().time()
+                    if not warning_sent and remaining <= 60:
+                        warning_sent = True
+                        log.info("Session %s expiring in %.0fs, notifying client", sid, remaining)
+                        await publish_event(r, sid, "session.expiring", {
+                            "session_id": sid,
+                            "remaining_sec": int(remaining),
+                        })
+                    if remaining <= 0:
+                        log.warning("Session %s exceeded max duration (%ss), force closing", sid, max_session_sec)
+                        await publish_event(r, sid, "session.expired", {
+                            "session_id": sid,
+                            "message": "session_expired",
+                        })
+                        if runner is not None:
+                            await runner.close()
                         runners.pop(sid, None)
                         break
-                    # Max session duration: warn at 60s remaining, then force close
-                    if session_deadline:
-                        remaining = session_deadline - asyncio.get_event_loop().time()
-                        if not warning_sent and remaining <= 60:
-                            warning_sent = True
-                            log.info("Session %s expiring in %.0fs, notifying client", sid, remaining)
-                            await publish_event(r, sid, "session.expiring", {
-                                "session_id": sid,
-                                "remaining_sec": int(remaining),
-                            })
-                        if remaining <= 0:
-                            log.warning("Session %s exceeded max duration (%ss), force closing", sid, max_session_sec)
-                            await publish_event(r, sid, "session.expired", {
-                                "session_id": sid,
-                                "message": "session_expired",
-                            })
-                            if runner is not None:
-                                await runner.close()
-                            runners.pop(sid, None)
-                            break
-                    await asyncio.sleep(0.5)
-                log.info("FlashTalk slot released by session %s", sid)
+                await asyncio.sleep(0.5)
+            log.info("FlashTalk slot released by session %s", sid)
+            return True
         finally:
             if acquired:
-                if _flashtalk_active_session_id == sid:
-                    _flashtalk_active_session_id = None
+                async with _get_slot_state_lock():
+                    _forget_active_session(sid)
+                    semaphore.release()
                 await _sync_slot_status(r)
 
     # Wait for lock with manual timeout check (avoids asyncio.wait_for cancelling the lock)
@@ -511,14 +600,12 @@ async def _init_flashtalk_with_queue(
             while True:
                 # Check cancellation (session deleted while waiting)
                 if cancelled:
-                    _slot_queue_size_dec()
-                    _forget_queued_session(sid)
+                    await _drop_queued_session(sid)
                     await _sync_slot_status(r)
                     return
                 # Check timeout
                 if deadline and asyncio.get_event_loop().time() > deadline:
-                    _slot_queue_size_dec()
-                    _forget_queued_session(sid)
+                    await _drop_queued_session(sid)
                     await _sync_slot_status(r)
                     log.warning("FlashTalk slot wait timed out (%ss) for session %s", timeout_sec, sid)
                     await set_session_state(r, sid, "error")
@@ -526,16 +613,13 @@ async def _init_flashtalk_with_queue(
                         "session_id": sid, "position": -1, "message": "timeout",
                     })
                     return
-                # Try to acquire lock without blocking (poll every 0.5s)
-                if not lock.locked():
-                    await _run_with_lock()
+                # Try to acquire a slot without blocking (poll every 0.5s)
+                if await _run_with_slot():
                     return
                 await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             # Session was deleted while waiting in queue
-            _slot_queue_size_dec()
-            _queued_tasks.pop(sid, None)
-            _forget_queued_session(sid)
+            await _drop_queued_session(sid)
             await _sync_slot_status(r)
             log.info("FlashTalk queued session %s cancelled (session deleted)", sid)
 
@@ -567,8 +651,10 @@ async def handle_worker_task(
             t = asyncio.create_task(
                 _init_flashtalk_with_queue(task, r, avatars_root, device, runners, sid)
             )
+            _queued_tasks[str(sid)] = t
 
             def _done(_t: asyncio.Task[None], _sid: str = str(sid)) -> None:
+                _queued_tasks.pop(_sid, None)
                 _log_task_exception(_t, _sid)
 
             t.add_done_callback(_done)

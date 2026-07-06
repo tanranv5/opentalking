@@ -62,7 +62,7 @@
 | `quicktalk + omnirt` | 保留为兼容服务化路径；本地单机优先使用 `quicktalk + local`。 |
 | `fasterliveportrait + omnirt` | FasterLivePortrait 文档覆盖 JoyVASA/chinese-hubert-base checkpoint、TensorRT 启动、`/v1/audio2video/fasterliveportrait`、前端参数和热更新。 |
 | `flashtalk + omnirt` | 有启动脚本、legacy fallback 说明，以及 README 中 Ascend 910B2 x8 的验证记录。 |
-| `flashhead + direct_ws` | 有配置接入路径，以及 Talking-head 文档中的 `/models` `reason=direct_ws` 示例。 |
+| `flashhead + direct_ws` | 有配置接入路径，以及 Talking-head 文档中的 `/models` `reason=flashhead_ws` 示例。 |
 
 ## 推荐起步路径
 

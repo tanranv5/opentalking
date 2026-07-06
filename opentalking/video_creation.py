@@ -245,8 +245,27 @@ def _audio2video_client(settings: object, model: str, sample_rate: int, backend:
     backend_name = str(getattr(backend, "backend", "") or "").strip().lower()
     if backend_name in {"omnirt", "direct_ws"}:
         if model == "flashhead":
-            from opentalking.providers.synthesis.flashhead import FlashHeadHTTPClient
+            from opentalking.providers.synthesis.flashhead import FlashHeadHTTPClient, FlashHeadWSClient
 
+            flashhead_ws_url = str(
+                getattr(backend, "ws_url", "") or getattr(settings, "flashhead_ws_url", "") or ""
+            ).strip()
+            flashhead_config = {
+                "fps": int(getattr(settings, "flashhead_fps", 25) or 25),
+                "sample_rate": int(getattr(settings, "flashhead_sample_rate", 16000) or 16000),
+                "width": int(getattr(settings, "flashhead_width", 416) or 416),
+                "height": int(getattr(settings, "flashhead_height", 704) or 704),
+                "frame_num": int(getattr(settings, "flashhead_frame_num", 25) or 25),
+                "chunk_samples": int(getattr(settings, "flashhead_chunk_samples", 16000) or 16000),
+            }
+            if flashhead_ws_url:
+                return OmniRTAudio2VideoClient(
+                    FlashHeadWSClient(
+                        ws_url=flashhead_ws_url,
+                        model=str(getattr(settings, "flashhead_model", "") or "soulx-flashhead-1.3b"),
+                        config=flashhead_config,
+                    )
+                )
             return OmniRTAudio2VideoClient(
                 FlashHeadHTTPClient(
                     base_url=str(getattr(settings, "flashhead_base_url", "") or "http://localhost:8766"),
@@ -257,12 +276,7 @@ def _audio2video_client(settings: object, model: str, sample_rate: int, backend:
                     output_remote_dir=str(getattr(settings, "flashhead_output_remote_dir", "") or ""),
                     output_base_url=str(getattr(settings, "flashhead_output_base_url", "") or ""),
                     timeout_sec=float(getattr(settings, "flashhead_timeout_sec", 600.0) or 600.0),
-                    fps=int(getattr(settings, "flashhead_fps", 25) or 25),
-                    sample_rate=int(getattr(settings, "flashhead_sample_rate", 16000) or 16000),
-                    width=int(getattr(settings, "flashhead_width", 416) or 416),
-                    height=int(getattr(settings, "flashhead_height", 704) or 704),
-                    frame_num=int(getattr(settings, "flashhead_frame_num", 25) or 25),
-                    chunk_samples=int(getattr(settings, "flashhead_chunk_samples", 16000) or 16000),
+                    **flashhead_config,
                 )
             )
         ws_url = str(getattr(backend, "ws_url", "") or "") if backend_name == "direct_ws" else resolve_synthesis_ws_url(model, settings)

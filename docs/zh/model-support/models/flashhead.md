@@ -40,6 +40,7 @@ FlashHead 在 OpenTalking 中主要通过外部生成式服务接入。当前 ad
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
 | `OPENTALKING_FLASHHEAD_BASE_URL` | `http://localhost:8766` | FlashHead HTTP 服务地址 |
+| `OPENTALKING_FLASHHEAD_WS_URL` | 空 | FlashHead WebSocket 服务地址；配置后优先走 `/v1/avatar/realtime` |
 | `OPENTALKING_FLASHHEAD_MODEL` | `soulx-flashhead-1.3b` | 服务侧模型名称 |
 | `OPENTALKING_FLASHHEAD_TIMEOUT_SEC` | `600.0` | HTTP 请求超时 |
 
@@ -77,14 +78,16 @@ FlashHead 在 OpenTalking 中主要通过外部生成式服务接入。当前 ad
 ```bash
 export OPENTALKING_FLASHHEAD_BACKEND=direct_ws
 export OPENTALKING_FLASHHEAD_BASE_URL=http://127.0.0.1:8766
+# 可选：使用仓内 resident 服务时，同一端口同时提供 HTTP 和 WS。
+export OPENTALKING_FLASHHEAD_WS_URL=ws://127.0.0.1:8766/v1/avatar/realtime
 ```
 
 如果输出文件不在本机可读，需要配置共享目录映射或输出下载地址。
 
 ## 启动与验证
 
-1. 启动 FlashHead HTTP 服务。
-2. 配置 `OPENTALKING_FLASHHEAD_BASE_URL`。
+1. 启动 FlashHead resident 服务：`python scripts/flashhead_http_service_resident.py --host 127.0.0.1 --port 8766`。
+2. 只配置 `OPENTALKING_FLASHHEAD_BASE_URL` 时走 HTTP fallback；同时配置 `OPENTALKING_FLASHHEAD_WS_URL` 时走 WebSocket。
 3. 启动 OpenTalking。
 4. WebUI 选择 `flashhead` 模型并创建会话。
 

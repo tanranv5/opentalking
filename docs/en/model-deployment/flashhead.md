@@ -57,7 +57,7 @@ curl -s http://127.0.0.1:8000/models | python3 -m json.tool
 After configuring the WebSocket URL, expected:
 
 ```json
-{"id":"flashhead","backend":"direct_ws","connected":true,"reason":"direct_ws"}
+{"id":"flashhead","backend":"direct_ws","connected":true,"reason":"flashhead_ws"}
 ```
 
 ## Common Errors
