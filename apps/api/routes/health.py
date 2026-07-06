@@ -123,6 +123,29 @@ def _runtime_status_payload(request: Request) -> dict[str, Any]:
     }
 
 
+def _configured_flashtalk_slot_capacity(request: Request) -> int | None:
+    settings = getattr(request.app.state, "settings", None)
+    if settings is None:
+        return None
+    try:
+        return max(1, int(getattr(settings, "flashtalk_slot_capacity", 1) or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _with_configured_slot_capacity(
+    request: Request,
+    status: dict[str, bool | int | str | list[str]],
+) -> dict[str, bool | int | str | list[str]]:
+    capacity = _configured_flashtalk_slot_capacity(request)
+    if capacity is None:
+        return status
+    active_count = int(status.get("active_count", 0) or 0)
+    status["slot_capacity"] = capacity
+    status["slots_available"] = max(0, capacity - active_count)
+    return status
+
+
 @router.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -141,11 +164,17 @@ async def runtime_status(request: Request) -> dict[str, Any]:
 @router.get("/queue/status")
 async def queue_status(request: Request) -> dict[str, bool | int | str | list[str]]:
     try:
-        return await get_flashtalk_queue_status(request.app.state.redis)
+        status = await get_flashtalk_queue_status(request.app.state.redis)
+        return _with_configured_slot_capacity(request, status)
     except Exception:
-        return {
+        status: dict[str, bool | int | str | list[str]] = {
             "slot_occupied": False,
             "queue_size": 0,
             "active_session_id": "",
+            "active_session_ids": [],
+            "active_count": 0,
+            "slot_capacity": 1,
+            "slots_available": 1,
             "queued_session_ids": [],
         }
+        return _with_configured_slot_capacity(request, status)

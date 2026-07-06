@@ -1089,6 +1089,28 @@ def test_queue_status_reads_shared_redis_state() -> None:
     }
 
 
+def test_queue_status_uses_configured_slot_capacity_for_legacy_redis_state() -> None:
+    redis = InMemoryRedis()
+    asyncio.run(
+        redis.hset(
+            FLASHTALK_QUEUE_STATUS,
+            mapping={"slot_occupied": "0", "queue_size": "0"},
+        )
+    )
+
+    app = FastAPI()
+    app.state.redis = redis
+    app.state.settings = SimpleNamespace(flashtalk_slot_capacity=2)
+    app.include_router(health_routes.router)
+
+    with TestClient(app) as client:
+        response = client.get("/queue/status")
+
+    assert response.status_code == 200
+    assert response.json()["slot_capacity"] == 2
+    assert response.json()["slots_available"] == 2
+
+
 def test_unified_prewarm_model_can_override_avatar_manifest_model() -> None:
     source = Path(unified_main.__file__).read_text(encoding="utf-8")
 
