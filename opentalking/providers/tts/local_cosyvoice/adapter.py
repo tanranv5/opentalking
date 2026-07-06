@@ -465,11 +465,11 @@ class LocalCosyVoiceTTSAdapter:
         }
         model_lower = self.model.lower()
         if "cosyvoice3" in model_lower:
-            cls = getattr(cosyvoice_module, "CosyVoice3")
+            cls = getattr(cosyvoice_module, "CosyVoice3", getattr(cosyvoice_module, "AutoModel"))
         elif "cosyvoice2" in model_lower:
-            cls = getattr(cosyvoice_module, "CosyVoice2")
+            cls = getattr(cosyvoice_module, "CosyVoice2", getattr(cosyvoice_module, "AutoModel"))
         else:
-            cls = getattr(cosyvoice_module, "CosyVoice")
+            cls = getattr(cosyvoice_module, "CosyVoice", getattr(cosyvoice_module, "AutoModel"))
         self._engine = _instantiate_cosyvoice_runtime(cls, model_dir, kwargs)
         return self._engine
 

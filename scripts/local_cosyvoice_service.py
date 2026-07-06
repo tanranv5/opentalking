@@ -591,6 +591,26 @@ class CosyVoiceService:
             print(f"zero_shot spk cached spk_id={spk_id}", flush=True)
             return spk_id
 
+    def _inference_zero_shot(
+        self,
+        model: Any,
+        text: str,
+        prompt_text: str,
+        prompt_audio: str,
+        *,
+        stream: bool,
+        spk_id: str,
+    ) -> Iterator[Any]:
+        infer = model.inference_zero_shot
+        if spk_id:
+            try:
+                return infer(text, "", "", zero_shot_spk_id=spk_id, stream=stream)
+            except TypeError as exc:
+                if "zero_shot_spk_id" not in str(exc):
+                    raise
+                print("zero_shot_spk_id unsupported; falling back to prompt path", flush=True)
+        return infer(text, prompt_text, prompt_audio, stream=stream)
+
     def _prompt_text_for_zero_shot(self, prompt_text: str) -> str:
         text = prompt_text.strip()
         if COSYVOICE3_END_OF_PROMPT in text:
@@ -637,12 +657,13 @@ class CosyVoiceService:
             if not clean_prompt_text:
                 raise HTTPException(status_code=400, detail="zero_shot prompt_text is empty after sanitization")
             spk_id = self._zero_shot_spk_id(model, prompt_audio, clean_prompt_text)
-            iterator = model.inference_zero_shot(
+            iterator = self._inference_zero_shot(
+                model,
                 text,
                 clean_prompt_text,
                 prompt_audio,
-                zero_shot_spk_id=spk_id,
                 stream=False,
+                spk_id=spk_id,
             )
         parts: list[np.ndarray] = []
         with self._model_lock:
@@ -686,12 +707,13 @@ class CosyVoiceService:
             if not clean_prompt_text:
                 raise HTTPException(status_code=400, detail="zero_shot prompt_text is empty after sanitization")
             spk_id = self._zero_shot_spk_id(model, prompt_audio, clean_prompt_text)
-            iterator = model.inference_zero_shot(
+            iterator = self._inference_zero_shot(
+                model,
                 text,
                 clean_prompt_text,
                 prompt_audio,
-                zero_shot_spk_id=spk_id,
                 stream=True,
+                spk_id=spk_id,
             )
         return iterator, source_sr, target_sr, t0, model
 

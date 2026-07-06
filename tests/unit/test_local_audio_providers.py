@@ -1398,7 +1398,7 @@ def test_cosyvoice_service_script_exposes_http_contract():
     assert "audio/L16" in service
 
 
-def test_cosyvoice_zero_shot_prompt_text_gets_endofprompt_prefix(monkeypatch):
+def test_cosyvoice_zero_shot_prompt_text_stays_as_reference_transcript(monkeypatch):
     from scripts import local_cosyvoice_service as service_module
 
     seen: dict[str, str] = {}
@@ -1436,8 +1436,7 @@ def test_cosyvoice_zero_shot_prompt_text_gets_endofprompt_prefix(monkeypatch):
     req = service_module.SynthesizeRequest(text="你好")
     service.synthesize_wav(req)
 
-    assert "<|endofprompt|>" in seen["prompt_text"]
-    assert seen["prompt_text"].endswith("开饭时间早上9点至下午5点。")
+    assert seen["prompt_text"] == "开饭时间早上9点至下午5点。"
 
 
 def test_cosyvoice_synthesize_route_uses_model_streaming_pcm(monkeypatch):
@@ -1477,7 +1476,7 @@ def test_cosyvoice_synthesize_route_uses_model_streaming_pcm(monkeypatch):
     assert resp.headers["content-type"].startswith("audio/L16")
     assert resp.headers["x-audio-sample-rate"] == "16000"
     assert seen["stream"] is True
-    assert "<|endofprompt|>" in seen["prompt_text"]
+    assert seen["prompt_text"] == "开饭时间早上9点至下午5点。"
     assert len(resp.content) > 0
 
 
