@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 import wave
 from types import SimpleNamespace
@@ -68,6 +69,7 @@ def _wav_bytes(*, seconds: float = 4.0, amplitude: int = 1200) -> bytes:
 
 def test_local_cosyvoice_clone_stores_prompt_locally(tmp_path, monkeypatch):
     inserted: dict[str, object] = {}
+    validated: dict[str, str] = {}
 
     monkeypatch.setenv("OPENTALKING_LOCAL_AUDIO_MODEL_ROOT", str(tmp_path / "models"))
     monkeypatch.setattr(voices_routes, "init_voice_store", lambda: None)
@@ -79,6 +81,7 @@ def test_local_cosyvoice_clone_stores_prompt_locally(tmp_path, monkeypatch):
     )
 
     async def fake_validate(wav, prompt_text):
+        validated["prompt_text"] = prompt_text
         return {"recognized_text": prompt_text, "duration_sec": 4.0, "active_sec": 3.5}
 
     monkeypatch.setattr(voices_routes, "_validate_local_cosyvoice_prompt", fake_validate)
@@ -110,12 +113,56 @@ def test_local_cosyvoice_clone_stores_prompt_locally(tmp_path, monkeypatch):
     assert body["entry_id"] == 42
     assert (voice_dir / "prompt.wav").is_file()
     assert (voice_dir / "prompt.txt").read_text(encoding="utf-8") == "开饭时间早上9点至下午5点。"
+    assert validated["prompt_text"] == "开饭时间早上9点至下午5点。"
+    meta = json.loads((voice_dir / "meta.json").read_text(encoding="utf-8"))
+    assert meta["prompt_text"] == "开饭时间早上9点至下午5点。"
     assert '"recognized_text": "开饭时间早上9点至下午5点。"' in (voice_dir / "meta.json").read_text(
         encoding="utf-8"
     )
     assert inserted["provider"] == "local_cosyvoice"
     assert inserted["voice_id"] == voice_id
     assert inserted["display_label"] == "本地客服女声"
+
+
+def test_local_cosyvoice_clone_strips_system_prompt_prefix(tmp_path, monkeypatch):
+    validated: dict[str, str] = {}
+
+    monkeypatch.setenv("OPENTALKING_LOCAL_AUDIO_MODEL_ROOT", str(tmp_path / "models"))
+    monkeypatch.setattr(voices_routes, "init_voice_store", lambda: None)
+    monkeypatch.setattr(voices_routes, "list_voices", lambda provider=None: [])
+    monkeypatch.setattr(
+        voices_routes.bailian_clone,
+        "convert_audio_to_wav_24k_mono",
+        lambda raw, suffix: _wav_bytes(),
+    )
+
+    async def fake_validate(wav, prompt_text):
+        validated["prompt_text"] = prompt_text
+        return {"recognized_text": prompt_text, "duration_sec": 4.0, "active_sec": 3.5}
+
+    monkeypatch.setattr(voices_routes, "_validate_local_cosyvoice_prompt", fake_validate)
+    monkeypatch.setattr(voices_routes, "insert_clone", lambda **kwargs: 43)
+
+    app = FastAPI()
+    app.include_router(voices_routes.router)
+    response = TestClient(app).post(
+        "/voices/clone",
+        data={
+            "provider": "local_cosyvoice",
+            "target_model": "FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
+            "display_label": "本地客服女声",
+            "prompt_text": "请始终使用标准普通话。<|endofprompt|>哎呀，听口音像是刚从国外回来啊。",
+        },
+        files={"audio": ("sample.wav", _wav_bytes(), "audio/wav")},
+    )
+
+    assert response.status_code == 200, response.text
+    voice_id = response.json()["voice_id"]
+    voice_dir = tmp_path / "models" / "voices" / "clones" / voice_id
+    assert validated["prompt_text"] == "哎呀，听口音像是刚从国外回来啊。"
+    assert (voice_dir / "prompt.txt").read_text(encoding="utf-8") == "哎呀，听口音像是刚从国外回来啊。"
+    meta = json.loads((voice_dir / "meta.json").read_text(encoding="utf-8"))
+    assert meta["prompt_text"] == "哎呀，听口音像是刚从国外回来啊。"
 
 
 

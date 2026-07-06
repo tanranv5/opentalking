@@ -27,6 +27,9 @@ try:
 except ModuleNotFoundError:
     from scripts._standalone_model_paths import load_model_paths
 
+COSYVOICE3_END_OF_PROMPT = "<|endofprompt|>"
+COSYVOICE3_PROMPT_PREFIX = "You are a helpful assistant."
+
 
 def _load_voice_assets_module():
     module_name = "_opentalking_voice_assets_local_cosyvoice"
@@ -193,24 +196,6 @@ def _callable_supports_keyword(fn: Any, name: str) -> bool:
         return False
     return name in signature.parameters or any(
         param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()
-    )
-
-
-def _voice_signature(asset: VoiceAsset) -> tuple[str, int, int, str]:
-    try:
-        stat = asset.prompt_audio.stat()
-    except OSError:
-        stat = None
-    try:
-        prompt_text = asset.prompt_text.read_text(encoding="utf-8").strip() if asset.prompt_text else ""
-    except OSError:
-        prompt_text = ""
-    digest = hashlib.sha1(prompt_text.encode("utf-8")).hexdigest()
-    return (
-        str(asset.prompt_audio.resolve()),
-        int(getattr(stat, "st_mtime_ns", 0) or 0),
-        int(getattr(stat, "st_size", 0) or 0),
-        digest,
     )
 
 
@@ -487,7 +472,8 @@ class CosyVoiceService:
         self._flow_tuning: dict[str, Any] = {}
         self._llm_token_ratio_tuning: dict[str, Any] = {}
         self._llm_stop_token_patch: dict[str, Any] = {}
-        self._zero_shot_spk_cache: dict[str, tuple[str, int, int, str]] = {}
+        self._zero_shot_spk_cache: dict[str, str] = {}
+        self._zero_shot_spk_lock = threading.Lock()
 
     def _audio_root(self) -> Path:
         if self.audio_root.strip():
@@ -506,31 +492,75 @@ class CosyVoiceService:
             require_prompt_text=True,
         )
 
-    def _ensure_zero_shot_spk_registered(self, model: Any, voice_id: str, asset: VoiceAsset) -> bool:
-        if not voice_id or asset.prompt_text is None:
-            return False
+    def _zero_shot_spk_fingerprint(self, prompt_audio: str, prompt_text: str) -> tuple[str, str]:
+        audio_path = Path(prompt_audio).expanduser()
+        try:
+            resolved_audio = str(audio_path.resolve())
+        except OSError:
+            resolved_audio = str(audio_path)
+        try:
+            stat = audio_path.stat()
+        except OSError:
+            stat = None
+        fingerprint_source = "|".join(
+            (
+                resolved_audio,
+                str(int(getattr(stat, "st_mtime_ns", 0) or 0)),
+                str(int(getattr(stat, "st_size", 0) or 0)),
+                prompt_text,
+            )
+        )
+        fingerprint = hashlib.sha1(fingerprint_source.encode("utf-8")).hexdigest()
+        return fingerprint, f"otcache_{fingerprint[:16]}"
+
+    def _remove_zero_shot_spk_cache_id(self, spk_id: str) -> None:
+        if not spk_id:
+            return
+        with self._zero_shot_spk_lock:
+            stale_keys = [key for key, cached_id in self._zero_shot_spk_cache.items() if cached_id == spk_id]
+            for key in stale_keys:
+                self._zero_shot_spk_cache.pop(key, None)
+
+    def _clear_zero_shot_spk_cache(self) -> None:
+        with self._zero_shot_spk_lock:
+            self._zero_shot_spk_cache.clear()
+
+    def _zero_shot_spk_id(self, model: Any, prompt_audio: str, prompt_text: str) -> str:
+        if not prompt_audio or not prompt_text:
+            return ""
         add_zero_shot_spk = getattr(model, "add_zero_shot_spk", None)
         if not callable(add_zero_shot_spk):
-            return False
-        signature = _voice_signature(asset)
-        if self._zero_shot_spk_cache.get(voice_id) == signature:
-            return True
-
-        prompt_text = asset.prompt_text.read_text(encoding="utf-8").strip()
-        if not prompt_text:
-            return False
-        prompt_text = self._prompt_text_for_zero_shot(prompt_text)
-        prompt_audio = str(asset.prompt_audio)
-        if _callable_supports_keyword(add_zero_shot_spk, "zero_shot_spk_id"):
-            add_zero_shot_spk(prompt_text, prompt_audio, zero_shot_spk_id=voice_id)
-        else:
-            add_zero_shot_spk(prompt_text, prompt_audio, voice_id)
-        self._zero_shot_spk_cache[voice_id] = signature
-        print(f"zero_shot_spk registered voice_id={voice_id} prompt_audio={prompt_audio}", flush=True)
+            return ""
+        fingerprint, spk_id = self._zero_shot_spk_fingerprint(prompt_audio, prompt_text)
+        with self._zero_shot_spk_lock:
+            cached_spk_id = self._zero_shot_spk_cache.get(fingerprint)
+            if cached_spk_id:
+                return cached_spk_id
+            try:
+                if _callable_supports_keyword(add_zero_shot_spk, "zero_shot_spk_id"):
+                    result = add_zero_shot_spk(prompt_text, prompt_audio, zero_shot_spk_id=spk_id)
+                else:
+                    result = add_zero_shot_spk(prompt_text, prompt_audio, spk_id)
+            except Exception as exc:
+                print(
+                    "zero_shot_spk registration failed; falling back to prompt path "
+                    f"prompt_audio={prompt_audio} error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                return ""
+            if result is False:
+                print(
+                    "zero_shot_spk registration returned false; falling back to prompt path "
+                    f"prompt_audio={prompt_audio}",
+                    flush=True,
+                )
+                return ""
+            self._zero_shot_spk_cache[fingerprint] = spk_id
+        print(f"zero_shot_spk registered spk_id={spk_id} prompt_audio={prompt_audio}", flush=True)
         save_spkinfo = getattr(model, "save_spkinfo", None)
         if callable(save_spkinfo):
             save_spkinfo()
-        return True
+        return spk_id
 
     def _precache_system_zero_shot_spks(self, model: Any) -> None:
         assets = iter_voice_assets(
@@ -540,7 +570,9 @@ class CosyVoiceService:
             require_prompt_text=True,
         )
         for asset in assets:
-            self._ensure_zero_shot_spk_registered(model, asset.voice_id, asset)
+            prompt_text = self._asset_prompt_text(asset)
+            if prompt_text:
+                self._zero_shot_spk_id(model, str(asset.prompt_audio), prompt_text)
 
     def model(self) -> Any:
         if self._model is not None:
@@ -618,7 +650,7 @@ class CosyVoiceService:
                 model_kwargs["load_trt"] = False
                 model_kwargs["fp16"] = False
                 self._model, self._loaded_model_kwargs = _instantiate_automodel(AutoModel, model_kwargs)
-        self._zero_shot_spk_cache.clear()
+        self._clear_zero_shot_spk_cache()
         self._apply_runtime_tuning()
         if self.precache_system_spks:
             self._precache_system_zero_shot_spks(self._model)
@@ -707,7 +739,7 @@ class CosyVoiceService:
                 )
             self.load_trt = False
             self.fp16 = False
-            self._zero_shot_spk_cache.clear()
+            self._clear_zero_shot_spk_cache()
             self._streaming_tuning = {}
             self._flow_tuning = {}
             self._llm_token_ratio_tuning = {}
@@ -754,11 +786,20 @@ class CosyVoiceService:
 
     def _prompt_text_for_zero_shot(self, prompt_text: str) -> str:
         text = prompt_text.strip()
-        if "<|endofprompt|>" in text:
+        if COSYVOICE3_END_OF_PROMPT in text:
+            text = text.rsplit(COSYVOICE3_END_OF_PROMPT, 1)[-1].strip()
+        if text and "cosyvoice3" in self.model_dir.lower():
+            return f"{COSYVOICE3_PROMPT_PREFIX}{COSYVOICE3_END_OF_PROMPT}{text}"
+        return text
+
+    def _instruction_for_instruct(self, instruction: str) -> str:
+        text = instruction.strip()
+        if not text:
             return text
-        if text:
-            return f"You are a helpful assistant.<|endofprompt|>{text}"
-        return "You are a helpful assistant.<|endofprompt|>"
+        if COSYVOICE3_END_OF_PROMPT in text:
+            instruction_text, _, _ = text.partition(COSYVOICE3_END_OF_PROMPT)
+            text = instruction_text.strip()
+        return f"{text}{COSYVOICE3_END_OF_PROMPT}" if text else COSYVOICE3_END_OF_PROMPT
 
     def _asset_prompt_text(self, asset: VoiceAsset, fallback_prompt_text: str = "") -> str:
         prompt_text = ""
@@ -766,7 +807,10 @@ class CosyVoiceService:
             prompt_text = asset.prompt_text.read_text(encoding="utf-8").strip()
         if not prompt_text:
             prompt_text = fallback_prompt_text.strip()
-        return self._prompt_text_for_zero_shot(prompt_text)
+        clean_prompt_text = self._prompt_text_for_zero_shot(prompt_text)
+        if not clean_prompt_text and fallback_prompt_text.strip() and fallback_prompt_text.strip() != prompt_text:
+            clean_prompt_text = self._prompt_text_for_zero_shot(fallback_prompt_text)
+        return clean_prompt_text
 
     def synthesize_wav(self, req: SynthesizeRequest) -> tuple[bytes, int, float]:
         text = req.text.strip()
@@ -786,19 +830,23 @@ class CosyVoiceService:
         elif mode == "instruct":
             if not prompt_audio:
                 raise HTTPException(status_code=400, detail="prompt_audio is required")
-            instruction = (req.instruction or self.instruction).strip()
+            instruction = self._instruction_for_instruct(req.instruction or self.instruction)
             iterator = model.inference_instruct2(text, instruction, prompt_audio, stream=False)
         else:
             asset = self._resolve_voice_asset(voice_id)
+            used_spk_id = ""
             if asset is not None:
                 asset_prompt_text = self._asset_prompt_text(asset, prompt_text)
                 asset_prompt_audio = str(asset.prompt_audio)
-                if (
-                    self.use_zero_shot_spk_id
-                    and _callable_supports_keyword(model.inference_zero_shot, "zero_shot_spk_id")
-                    and self._ensure_zero_shot_spk_registered(model, asset.voice_id, asset)
+                if not asset_prompt_text:
+                    raise HTTPException(status_code=400, detail="zero_shot prompt_text is empty after sanitization")
+                if self.use_zero_shot_spk_id and _callable_supports_keyword(
+                    model.inference_zero_shot,
+                    "zero_shot_spk_id",
                 ):
-                    iterator = model.inference_zero_shot(text, "", "", stream=False, zero_shot_spk_id=asset.voice_id)
+                    used_spk_id = self._zero_shot_spk_id(model, asset_prompt_audio, asset_prompt_text)
+                if used_spk_id:
+                    iterator = model.inference_zero_shot(text, "", "", stream=False, zero_shot_spk_id=used_spk_id)
                 else:
                     iterator = model.inference_zero_shot(
                         text,
@@ -812,15 +860,26 @@ class CosyVoiceService:
                         status_code=400,
                         detail="zero_shot mode requires prompt_audio and prompt_text",
                     )
-                iterator = model.inference_zero_shot(
-                    text,
-                    self._prompt_text_for_zero_shot(prompt_text),
-                    prompt_audio,
-                    stream=False,
-                )
+                clean_prompt_text = self._prompt_text_for_zero_shot(prompt_text)
+                if not clean_prompt_text:
+                    raise HTTPException(status_code=400, detail="zero_shot prompt_text is empty after sanitization")
+                if self.use_zero_shot_spk_id and _callable_supports_keyword(
+                    model.inference_zero_shot,
+                    "zero_shot_spk_id",
+                ):
+                    used_spk_id = self._zero_shot_spk_id(model, prompt_audio, clean_prompt_text)
+                if used_spk_id:
+                    iterator = model.inference_zero_shot(text, "", "", stream=False, zero_shot_spk_id=used_spk_id)
+                else:
+                    iterator = model.inference_zero_shot(
+                        text,
+                        clean_prompt_text,
+                        prompt_audio,
+                        stream=False,
+                    )
             if asset is not None:
                 print(
-                    f"zero_shot {'spk_id' if self.use_zero_shot_spk_id else 'prompt_path'} voice_id={asset.voice_id} stream=False prompt_audio={asset.prompt_audio}",
+                    f"zero_shot {'spk_id' if used_spk_id else 'prompt_path'} voice_id={asset.voice_id} stream=False prompt_audio={asset.prompt_audio}",
                     flush=True,
                 )
         parts: list[np.ndarray] = []
@@ -858,19 +917,23 @@ class CosyVoiceService:
         elif mode == "instruct":
             if not prompt_audio:
                 raise HTTPException(status_code=400, detail="prompt_audio is required")
-            instruction = (req.instruction or self.instruction).strip()
+            instruction = self._instruction_for_instruct(req.instruction or self.instruction)
             iterator = model.inference_instruct2(text, instruction, prompt_audio, stream=True)
         else:
             asset = self._resolve_voice_asset(voice_id)
+            used_spk_id = ""
             if asset is not None:
                 asset_prompt_text = self._asset_prompt_text(asset, prompt_text)
                 asset_prompt_audio = str(asset.prompt_audio)
-                if (
-                    self.use_zero_shot_spk_id
-                    and _callable_supports_keyword(model.inference_zero_shot, "zero_shot_spk_id")
-                    and self._ensure_zero_shot_spk_registered(model, asset.voice_id, asset)
+                if not asset_prompt_text:
+                    raise HTTPException(status_code=400, detail="zero_shot prompt_text is empty after sanitization")
+                if self.use_zero_shot_spk_id and _callable_supports_keyword(
+                    model.inference_zero_shot,
+                    "zero_shot_spk_id",
                 ):
-                    iterator = model.inference_zero_shot(text, "", "", stream=True, zero_shot_spk_id=asset.voice_id)
+                    used_spk_id = self._zero_shot_spk_id(model, asset_prompt_audio, asset_prompt_text)
+                if used_spk_id:
+                    iterator = model.inference_zero_shot(text, "", "", stream=True, zero_shot_spk_id=used_spk_id)
 
                     def fallback_iterator(
                         *,
@@ -878,11 +941,12 @@ class CosyVoiceService:
                         prompt_text: str = asset_prompt_text,
                         prompt_audio: str = asset_prompt_audio,
                         voice_id: str = asset.voice_id,
+                        spk_id: str = used_spk_id,
                     ) -> Iterator[Any]:
-                        self._zero_shot_spk_cache.pop(voice_id, None)
+                        self._remove_zero_shot_spk_cache_id(spk_id)
                         print(
                             "zero_shot_spk_id produced no audio; falling back to prompt "
-                            f"voice_id={voice_id} prompt_audio={prompt_audio}",
+                            f"voice_id={voice_id} spk_id={spk_id} prompt_audio={prompt_audio}",
                             flush=True,
                         )
                         return model.inference_zero_shot(text, prompt_text, prompt_audio, stream=True)
@@ -901,15 +965,43 @@ class CosyVoiceService:
                         status_code=400,
                         detail="zero_shot mode requires prompt_audio and prompt_text",
                     )
-                iterator = model.inference_zero_shot(
-                    text,
-                    self._prompt_text_for_zero_shot(prompt_text),
-                    prompt_audio,
-                    stream=True,
-                )
+                clean_prompt_text = self._prompt_text_for_zero_shot(prompt_text)
+                if not clean_prompt_text:
+                    raise HTTPException(status_code=400, detail="zero_shot prompt_text is empty after sanitization")
+                if self.use_zero_shot_spk_id and _callable_supports_keyword(
+                    model.inference_zero_shot,
+                    "zero_shot_spk_id",
+                ):
+                    used_spk_id = self._zero_shot_spk_id(model, prompt_audio, clean_prompt_text)
+                if used_spk_id:
+                    iterator = model.inference_zero_shot(text, "", "", stream=True, zero_shot_spk_id=used_spk_id)
+
+                    def fallback_iterator(
+                        *,
+                        text: str = text,
+                        prompt_text: str = clean_prompt_text,
+                        prompt_audio: str = prompt_audio,
+                        spk_id: str = used_spk_id,
+                    ) -> Iterator[Any]:
+                        self._remove_zero_shot_spk_cache_id(spk_id)
+                        print(
+                            "zero_shot_spk_id produced no audio; falling back to prompt "
+                            f"spk_id={spk_id} prompt_audio={prompt_audio}",
+                            flush=True,
+                        )
+                        return model.inference_zero_shot(text, prompt_text, prompt_audio, stream=True)
+
+                    fallback_iterator_factory = fallback_iterator
+                else:
+                    iterator = model.inference_zero_shot(
+                        text,
+                        clean_prompt_text,
+                        prompt_audio,
+                        stream=True,
+                    )
             if asset is not None:
                 print(
-                    f"zero_shot {'spk_id' if self.use_zero_shot_spk_id else 'prompt_path'} voice_id={asset.voice_id} stream=True prompt_audio={asset.prompt_audio}",
+                    f"zero_shot {'spk_id' if used_spk_id else 'prompt_path'} voice_id={asset.voice_id} stream=True prompt_audio={asset.prompt_audio}",
                     flush=True,
                 )
         return iterator, source_sr, target_sr, t0, model, fallback_iterator_factory

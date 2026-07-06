@@ -1466,7 +1466,7 @@ def test_cosyvoice_service_script_exposes_http_contract():
     assert "audio/L16" in service
 
 
-def test_cosyvoice_zero_shot_prompt_text_gets_endofprompt_prefix(monkeypatch):
+def test_cosyvoice_zero_shot_prompt_text_stays_as_reference_transcript(monkeypatch):
     from scripts import local_cosyvoice_service as service_module
 
     seen: dict[str, str] = {}
@@ -1504,8 +1504,7 @@ def test_cosyvoice_zero_shot_prompt_text_gets_endofprompt_prefix(monkeypatch):
     req = service_module.SynthesizeRequest(text="你好")
     service.synthesize_wav(req)
 
-    assert "<|endofprompt|>" in seen["prompt_text"]
-    assert seen["prompt_text"].endswith("开饭时间早上9点至下午5点。")
+    assert seen["prompt_text"] == "开饭时间早上9点至下午5点。"
 
 
 def test_cosyvoice_synthesize_route_uses_model_streaming_pcm(monkeypatch):
@@ -1545,7 +1544,7 @@ def test_cosyvoice_synthesize_route_uses_model_streaming_pcm(monkeypatch):
     assert resp.headers["content-type"].startswith("audio/L16")
     assert resp.headers["x-audio-sample-rate"] == "16000"
     assert seen["stream"] is True
-    assert "<|endofprompt|>" in seen["prompt_text"]
+    assert seen["prompt_text"] == "开饭时间早上9点至下午5点。"
     assert len(resp.content) > 0
 
 
@@ -1590,7 +1589,198 @@ def test_cosyvoice_service_request_prompt_overrides_default(monkeypatch):
     assert resp.status_code == 200
     assert seen["stream"] is True
     assert seen["prompt_wav"] == "/tmp/local-voice.wav"
-    assert str(seen["prompt_text"]).endswith("这是本地复刻音色文本。")
+    assert seen["prompt_text"] == "这是本地复刻音色文本。"
+
+
+def test_cosyvoice_instruct_appends_endofprompt_when_missing(monkeypatch):
+    from fastapi.testclient import TestClient
+    from scripts import local_cosyvoice_service as service_module
+
+    seen: dict[str, object] = {}
+
+    class FakeEngine:
+        sample_rate = 24000
+
+        def inference_instruct2(self, text, instruction, prompt_wav, stream=False):
+            seen["instruction"] = instruction
+            seen["prompt_wav"] = prompt_wav
+            seen["stream"] = stream
+            yield {"tts_speech": np.zeros((1, 120), dtype=np.float32)}
+
+    monkeypatch.setattr(service_module.CosyVoiceService, "model", lambda self: FakeEngine())
+
+    service = service_module.CosyVoiceService(
+        model_dir="/tmp/Fun-CosyVoice3-0.5B-2512",
+        runtime_dir="/tmp/runtime",
+        device="cpu",
+        prompt_audio="/tmp/default.wav",
+        prompt_text="默认文本",
+        mode="instruct",
+        instruction="用冷漠严厉的语气说。",
+        fp16=False,
+    )
+
+    resp = TestClient(service_module.create_app(service)).post(
+        "/synthesize",
+        json={"text": "你好", "sample_rate": 16000},
+    )
+
+    assert resp.status_code == 200
+    assert seen["stream"] is True
+    assert seen["prompt_wav"] == "/tmp/default.wav"
+    assert seen["instruction"] == "用冷漠严厉的语气说。<|endofprompt|>"
+
+
+def test_cosyvoice_zero_shot_prompt_text_strips_system_prompt_prefix(monkeypatch):
+    from fastapi.testclient import TestClient
+    from scripts import local_cosyvoice_service as service_module
+
+    seen: dict[str, object] = {}
+
+    class FakeEngine:
+        sample_rate = 24000
+
+        def inference_zero_shot(self, text, prompt_text, prompt_wav, stream=False):
+            seen["prompt_text"] = prompt_text
+            seen["prompt_wav"] = prompt_wav
+            seen["stream"] = stream
+            yield {"tts_speech": np.zeros((1, 120), dtype=np.float32)}
+
+    monkeypatch.setattr(service_module.CosyVoiceService, "model", lambda self: FakeEngine())
+
+    service = service_module.CosyVoiceService(
+        model_dir="/tmp/Fun-CosyVoice3-0.5B-2512",
+        runtime_dir="/tmp/runtime",
+        device="cpu",
+        prompt_audio="/tmp/default.wav",
+        prompt_text="You are a helpful assistant.<|endofprompt|>默认文本",
+        mode="zero_shot",
+        instruction="",
+        fp16=False,
+    )
+
+    resp = TestClient(service_module.create_app(service)).post(
+        "/synthesize",
+        json={
+            "text": "你好",
+            "sample_rate": 16000,
+            "prompt_audio": "/tmp/local-voice.wav",
+            "prompt_text": "请始终使用标准普通话。<|endofprompt|>这是本地复刻音色文本。",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert seen["stream"] is True
+    assert seen["prompt_wav"] == "/tmp/local-voice.wav"
+    assert seen["prompt_text"] == "You are a helpful assistant.<|endofprompt|>这是本地复刻音色文本。"
+
+
+def test_cosyvoice_zero_shot_spk_cache_reuses_registered_id(tmp_path, monkeypatch):
+    from scripts import local_cosyvoice_service as service_module
+
+    monkeypatch.setenv("OPENTALKING_LOCAL_AUDIO_MODEL_ROOT", str(tmp_path))
+    voice_dir = tmp_path / "voices" / "clones" / "local-cache-voice"
+    voice_dir.mkdir(parents=True)
+    prompt_audio = voice_dir / "prompt.wav"
+    prompt_audio.write_bytes(b"RIFFtest")
+    (voice_dir / "prompt.txt").write_text(
+        "请始终使用标准普通话。<|endofprompt|>这是一段本地音色参考文本。",
+        encoding="utf-8",
+    )
+
+    class FakeEngine:
+        sample_rate = 24000
+
+        def __init__(self):
+            self.add_calls: list[tuple[str, str, str]] = []
+            self.infer_calls: list[tuple[str, str, str, bool]] = []
+
+        def add_zero_shot_spk(self, prompt_text, prompt_wav, zero_shot_spk_id):
+            self.add_calls.append((prompt_text, prompt_wav, zero_shot_spk_id))
+            return True
+
+        def inference_zero_shot(self, text, prompt_text, prompt_wav, stream=False, zero_shot_spk_id=""):
+            self.infer_calls.append((prompt_text, prompt_wav, zero_shot_spk_id, stream))
+            yield {"tts_speech": np.zeros((1, 80), dtype=np.float32)}
+
+    engine = FakeEngine()
+    service = service_module.CosyVoiceService(
+        model_dir="/tmp/Fun-CosyVoice3-0.5B-2512",
+        runtime_dir="/tmp/runtime",
+        device="cpu",
+        prompt_audio="",
+        prompt_text="",
+        mode="zero_shot",
+        instruction="",
+        fp16=False,
+        use_zero_shot_spk_id=True,
+    )
+    monkeypatch.setattr(service, "model", lambda: engine)
+
+    req = service_module.SynthesizeRequest(text="你好", voice="local-cache-voice")
+    service.synthesize_wav(req)
+    service.synthesize_wav(req)
+
+    engine_prompt_text = "You are a helpful assistant.<|endofprompt|>这是一段本地音色参考文本。"
+    assert len(engine.add_calls) == 1
+    assert engine.add_calls[0][0] == engine_prompt_text
+    assert engine.add_calls[0][1] == str(prompt_audio)
+    spk_id = engine.add_calls[0][2]
+    assert spk_id.startswith("otcache_")
+    assert engine.infer_calls == [
+        ("", "", spk_id, False),
+        ("", "", spk_id, False),
+    ]
+
+
+def test_cosyvoice_zero_shot_spk_cache_falls_back_when_register_fails(tmp_path, monkeypatch):
+    from scripts import local_cosyvoice_service as service_module
+
+    monkeypatch.setenv("OPENTALKING_LOCAL_AUDIO_MODEL_ROOT", str(tmp_path))
+    voice_dir = tmp_path / "voices" / "clones" / "local-cache-voice"
+    voice_dir.mkdir(parents=True)
+    prompt_audio = voice_dir / "prompt.wav"
+    prompt_audio.write_bytes(b"RIFFtest")
+    (voice_dir / "prompt.txt").write_text("这是一段本地音色参考文本。", encoding="utf-8")
+
+    class FakeEngine:
+        sample_rate = 24000
+
+        def __init__(self):
+            self.add_calls: list[tuple[str, str, str]] = []
+            self.infer_calls: list[tuple[str, str, str, bool]] = []
+
+        def add_zero_shot_spk(self, prompt_text, prompt_wav, zero_shot_spk_id):
+            self.add_calls.append((prompt_text, prompt_wav, zero_shot_spk_id))
+            return False
+
+        def inference_zero_shot(self, text, prompt_text, prompt_wav, stream=False, zero_shot_spk_id=""):
+            self.infer_calls.append((prompt_text, prompt_wav, zero_shot_spk_id, stream))
+            yield {"tts_speech": np.zeros((1, 80), dtype=np.float32)}
+
+    engine = FakeEngine()
+    service = service_module.CosyVoiceService(
+        model_dir="/tmp/Fun-CosyVoice3-0.5B-2512",
+        runtime_dir="/tmp/runtime",
+        device="cpu",
+        prompt_audio="",
+        prompt_text="",
+        mode="zero_shot",
+        instruction="",
+        fp16=False,
+        use_zero_shot_spk_id=True,
+    )
+    monkeypatch.setattr(service, "model", lambda: engine)
+
+    service.synthesize_wav(service_module.SynthesizeRequest(text="你好", voice="local-cache-voice"))
+
+    engine_prompt_text = "You are a helpful assistant.<|endofprompt|>这是一段本地音色参考文本。"
+    assert len(engine.add_calls) == 1
+    assert engine.add_calls[0][0] == engine_prompt_text
+    assert engine.add_calls[0][1] == str(prompt_audio)
+    assert engine.infer_calls == [
+        (engine_prompt_text, str(prompt_audio), "", False),
+    ]
 
 
 def test_cosyvoice_service_applies_validated_runtime_tuning(monkeypatch):
