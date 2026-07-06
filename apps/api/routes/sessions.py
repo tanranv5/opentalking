@@ -966,6 +966,29 @@ async def speak(session_id: str, body: SpeakRequest, request: Request) -> dict[s
     return {"session_id": session_id, "status": "queued"}
 
 
+@router.post("/{session_id}/say")
+async def say(session_id: str, body: SpeakRequest, request: Request) -> dict[str, str]:
+    """直接播报 assistant 文本，不把文本当作用户输入交给 LLM。"""
+    r: redis.Redis = request.app.state.redis
+    s = await session_service.get_session(r, session_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="session not found")
+    voice, eff_prov, tm = _normalize_voice_for_speak(
+        voice=body.voice,
+        tts_provider=body.tts_provider,
+        tts_model=body.tts_model,
+    )
+    await session_service.speak_direct(
+        r,
+        session_id,
+        body.text,
+        voice=voice,
+        tts_provider=eff_prov,
+        tts_model=tm,
+    )
+    return {"session_id": session_id, "status": "queued"}
+
+
 def _normalize_requested_stt_provider(value: str | None) -> str | None:
     try:
         return normalize_stt_provider(value, default=None)

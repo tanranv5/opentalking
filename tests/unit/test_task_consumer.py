@@ -102,6 +102,26 @@ class ChatCapableRunner(StubRunner):
         return task
 
 
+class DirectSpeakRunner(StubRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.direct_calls: list[dict[str, object]] = []
+
+    def create_direct_speak_task(
+        self,
+        text: str,
+        tts_voice: str | None = None,
+        **kwargs: object,
+    ) -> asyncio.Task[None]:
+        async def _direct() -> None:
+            self.direct_calls.append({"text": text, "tts_voice": tts_voice, **kwargs})
+
+        task = asyncio.create_task(_direct())
+        self.speech_tasks.add(task)
+        task.add_done_callback(self.speech_tasks.discard)
+        return task
+
+
 def test_task_knowledge_base_ids_do_not_fallback_to_default() -> None:
     assert task_consumer._task_knowledge_base_ids({}) == []
     assert task_consumer._task_knowledge_base_ids({"knowledge_base_ids": []}) == []
@@ -924,6 +944,73 @@ def test_speak_flashtalk_uploaded_pcm_queues_redis_pcm_key() -> None:
         assert base64.b64decode(stored) == pcm
 
     asyncio.run(run())
+
+
+def test_speak_direct_queues_direct_text_task() -> None:
+    async def run() -> None:
+        redis = InMemoryRedis()
+        sid = "sess_direct_service"
+
+        await session_service.speak_direct(
+            redis,
+            sid,
+            "开场白",
+            voice="voice-a",
+            tts_provider="local_cosyvoice",
+            tts_model="cosyvoice3",
+        )
+
+        await redis.brpop(TASK_QUEUE, timeout=1)
+        res = await redis.brpop(TASK_QUEUE, timeout=1)
+        assert res is not None
+        _, raw = res
+        task = json.loads(raw)
+        assert task["cmd"] == "speak_direct"
+        assert task["session_id"] == sid
+        assert task["text"] == "开场白"
+        assert task["voice"] == "voice-a"
+        assert task["tts_voice"] == "voice-a"
+        assert task["tts_provider"] == "local_cosyvoice"
+        assert task["tts_model"] == "cosyvoice3"
+
+    asyncio.run(run())
+
+
+@pytest.mark.asyncio
+async def test_handle_worker_task_routes_direct_speak_without_chat() -> None:
+    sid = "sess_direct_worker"
+    redis = InMemoryRedis()
+    await redis.hset(session_key(sid), mapping={"session_id": sid, "state": "ready", "model": "quicktalk"})
+    runner = DirectSpeakRunner()
+    await runner.prepare()
+
+    await handle_worker_task(
+        {
+            "cmd": "speak_direct",
+            "session_id": sid,
+            "text": "开场白",
+            "tts_voice": "voice-a",
+            "tts_provider": "local_cosyvoice",
+            "tts_model": "cosyvoice3",
+            "enqueue_unix": 123.0,
+        },
+        redis,
+        Path("."),
+        "cpu",
+        {sid: runner},
+    )
+    await asyncio.sleep(0)
+
+    assert runner.spoken == []
+    assert runner.direct_calls == [
+        {
+            "text": "开场白",
+            "tts_voice": "voice-a",
+            "tts_provider": "local_cosyvoice",
+            "tts_model": "cosyvoice3",
+            "enqueue_unix": 123.0,
+        }
+    ]
 
 
 def test_handle_worker_task_reads_uploaded_pcm_from_redis_key() -> None:

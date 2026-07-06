@@ -96,7 +96,13 @@ class FlashHeadWSClient:
         ref_image: bytes | str | Path,
         prompt: str = "A person is talking. Only the foreground characters are moving, the background remains static.",
         seed: int = 9999,
+        wav2lip_postprocess_mode: str | None = None,
+        mouth_metadata: dict[str, Any] | None = None,
+        video_config: dict[str, Any] | None = None,
+        **_: Any,
     ) -> dict[str, Any]:
+        # FlashHead 不消费这些通用 runner 元数据；保留参数是为了兼容统一的音频驱动接口。
+        del wav2lip_postprocess_mode, mouth_metadata, video_config
         if self._ws is None:
             await self.connect()
 

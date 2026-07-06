@@ -294,6 +294,33 @@ async def speak(
     await _push_task(r, task)
 
 
+async def speak_direct(
+    r: redis.Redis,
+    sid: str,
+    text: str,
+    *,
+    voice: str | None = None,
+    tts_provider: str | None = None,
+    tts_model: str | None = None,
+) -> None:
+    """直接播报给定 assistant 文本，不走 LLM 回复生成。"""
+    await interrupt(r, sid)
+    task: dict[str, Any] = {
+        "cmd": "speak_direct",
+        "session_id": sid,
+        "text": text,
+        "enqueue_unix": time.time(),
+    }
+    if voice:
+        task["voice"] = voice
+        task["tts_voice"] = voice
+    if tts_provider:
+        task["tts_provider"] = tts_provider.strip().lower()
+    if tts_model:
+        task["tts_model"] = tts_model.strip()
+    await _push_task(r, task)
+
+
 async def interrupt(r: redis.Redis, sid: str) -> None:
     await _push_task(r, {"cmd": "interrupt", "session_id": sid})
 

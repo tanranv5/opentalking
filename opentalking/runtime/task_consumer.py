@@ -717,6 +717,40 @@ async def handle_worker_task(
                 tts_model=tts_model or None,
                 enqueue_unix=enqueue_value,
             )
+    elif cmd == "speak_direct":
+        text = str(task.get("text", ""))
+        raw_voice = task.get("tts_voice") or task.get("voice")
+        tts_voice = str(raw_voice).strip() if raw_voice else None
+        tp = task.get("tts_provider")
+        tts_provider = str(tp).strip().lower() if tp else None
+        tm = task.get("tts_model")
+        tts_model = str(tm).strip() if tm else None
+        enqueue_unix = task.get("enqueue_unix")
+        enqueue_value = (
+            float(enqueue_unix) if isinstance(enqueue_unix, (int, float)) else None
+        )
+        create_direct_speak_task = getattr(runner, "create_direct_speak_task", None)
+        if callable(create_direct_speak_task):
+            create_direct_speak_task(
+                text,
+                tts_voice=tts_voice or None,
+                tts_provider=tts_provider or None,
+                tts_model=tts_model or None,
+                enqueue_unix=enqueue_value,
+            )
+        else:
+            log.warning("direct speak unsupported runner session=%s", sid)
+            await set_session_state(r, sid, "error")
+            await publish_event(
+                r,
+                sid,
+                "error",
+                {
+                    "session_id": sid,
+                    "code": "DIRECT_SPEAK_UNSUPPORTED",
+                    "message": "runner does not support direct speak",
+                },
+            )
     elif cmd == "update_agent_knowledge_bases":
         _update_runner_agent_knowledge_bases(runner, _task_knowledge_base_ids(task))
     elif cmd == "speak_flashtalk_audio":

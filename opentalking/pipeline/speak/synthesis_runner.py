@@ -1716,6 +1716,97 @@ class FlashTalkRunner:
         task.add_done_callback(self.speech_tasks.discard)
         return task
 
+    def create_direct_speak_task(
+        self,
+        text: str,
+        tts_voice: str | None = None,
+        *,
+        tts_provider: str | None = None,
+        tts_model: str | None = None,
+        enqueue_unix: float | None = None,
+    ) -> asyncio.Task[None]:
+        task = asyncio.create_task(
+            self._run_direct_speak_task(
+                text,
+                tts_voice=tts_voice,
+                tts_provider=tts_provider,
+                tts_model=tts_model,
+                enqueue_unix=enqueue_unix,
+            )
+        )
+        self.speech_tasks.add(task)
+        task.add_done_callback(self.speech_tasks.discard)
+        return task
+
+    async def _run_direct_speak_task(
+        self,
+        text: str,
+        tts_voice: str | None = None,
+        *,
+        tts_provider: str | None = None,
+        tts_model: str | None = None,
+        enqueue_unix: float | None = None,
+    ) -> None:
+        log.info("direct speak start: %s (session=%s)", text[:30], self.session_id)
+        try:
+            await self.speak_direct_text(
+                text,
+                tts_voice=tts_voice,
+                tts_provider=tts_provider,
+                tts_model=tts_model,
+                enqueue_unix=enqueue_unix,
+            )
+            log.info("direct speak done: session=%s", self.session_id)
+        except asyncio.CancelledError:
+            log.info("direct speak cancelled: session=%s", self.session_id)
+        except Exception:  # noqa: BLE001
+            log.exception("direct speak failed: session=%s", self.session_id)
+            if not getattr(self, "_closed", False):
+                await set_session_state(self.redis, self.session_id, "error")
+
+    async def speak_direct_text(
+        self,
+        text: str,
+        tts_voice: str | None = None,
+        *,
+        tts_provider: str | None = None,
+        tts_model: str | None = None,
+        enqueue_unix: float | None = None,
+    ) -> None:
+        """直接播报 assistant 文本：TTS -> PCM -> 现有音频驱动对口型链路。"""
+        speech_text = sanitize_tts_text(strip_emoji(text)).strip()
+        if not speech_text or getattr(self, "_closed", False):
+            return
+
+        tts = create_tts_adapter(
+            sample_rate=16000,
+            chunk_ms=self._speech_chunk_ms(),
+            settings=self._tts_settings,
+            default_voice=tts_voice,
+            tts_provider=tts_provider,
+            tts_model=tts_model,
+        )
+        parts: list[np.ndarray] = []
+        try:
+            async for chunk in tts.synthesize_stream(speech_text):
+                pcm = np.asarray(chunk.data, dtype=np.int16)
+                if pcm.size:
+                    parts.append(np.ascontiguousarray(pcm))
+        finally:
+            if hasattr(tts, "aclose"):
+                try:
+                    await tts.aclose()
+                except Exception:
+                    log.exception("direct speak TTS adapter aclose failed")
+        if not parts:
+            raise RuntimeError("direct speak TTS produced no audio")
+        pcm = np.concatenate(parts).astype(np.int16, copy=False)
+        await self.speak_uploaded_pcm(
+            pcm,
+            enqueue_unix=enqueue_unix,
+            speech_text=speech_text,
+        )
+
     async def _run_speak_uploaded_pcm_task(
         self,
         pcm_path: str,
@@ -2568,6 +2659,7 @@ class FlashTalkRunner:
         pcm: np.ndarray,
         *,
         enqueue_unix: float | None = None,
+        speech_text: str | None = None,
     ) -> None:
         """仅 FlashTalk：将用户上传解码后的 16 kHz mono int16 PCM 直接对口型，不经 LLM/TTS。"""
         async with self._speak_lock:
@@ -2591,7 +2683,7 @@ class FlashTalkRunner:
                 self.redis,
                 self.session_id,
                 "speech.started",
-                {"session_id": self.session_id, "text": "[上传音频]"},
+                {"session_id": self.session_id, "text": speech_text or "[上传音频]"},
             )
             self._speech_started = True
 
@@ -2641,10 +2733,12 @@ class FlashTalkRunner:
                     audio_buffer = np.concatenate(
                         [audio_buffer, np.zeros(pad_len, dtype=np.int16)]
                     )
+                pending_subtitle = speech_text.strip() if speech_text else None
                 while len(audio_buffer) >= chunk_samples:
                     chunk = audio_buffer[:chunk_samples]
                     audio_buffer = audio_buffer[chunk_samples:]
-                    await audio_q.put((chunk, None))
+                    await audio_q.put((chunk, pending_subtitle))
+                    pending_subtitle = None
                     if "first_chunk_queued_ms" not in timing:
                         timing["first_chunk_queued_ms"] = (
                             time.perf_counter() - t_speak_wall0
@@ -2798,7 +2892,7 @@ class FlashTalkRunner:
                 ),
             )
 
-            await self._publish_speech_ended(None)
+            await self._publish_speech_ended(speech_text.strip() if speech_text else None)
             if not self._closed:
                 await set_session_state(self.redis, self.session_id, "ready")
 
