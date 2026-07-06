@@ -1847,13 +1847,14 @@ class SessionRunner:
                         },
                     )
 
+                    tts_text = f"{cosyvoice3_instruction_prefix}{text}" if cosyvoice3_instruction_prefix else text
                     sentence_enqueued = 0
 
                     async def _enqueue_from_tts(tts_adapter: Any) -> int:
                         nonlocal chunk_idx
                         nonlocal sentence_enqueued
                         enqueued = 0
-                        async for tts_chunk in tts_adapter.synthesize_stream(text):
+                        async for tts_chunk in tts_adapter.synthesize_stream(tts_text):
                             if self._interrupt.is_set():
                                 break
                             if chunk_idx == 0:
@@ -1908,6 +1909,16 @@ class SessionRunner:
                         timing.add_count("tts_edge_fallbacks", 1)
                         return await _enqueue_from_tts(fallback_tts)
 
+                # Brain 会把 CosyVoice3 语气指令放在 <|endofprompt|> 前。
+                # 这里先拦截控制前缀，避免字幕/TTS 把“用某种语气说”当正文播出。
+                cosyvoice3_separator = "<|endofprompt|>"
+                cosyvoice3_instruction_prefix = ""
+                cosyvoice3_pending_prefix = ""
+                effective_tts_provider = str(
+                    tts_provider or getattr(self._tts_settings, "provider", "") or ""
+                ).strip().lower()
+                cosyvoice3_detection_done = effective_tts_provider not in {"", "local_cosyvoice"}
+
                 # 首句尽早送 TTS：拿到 N 个字或软标点（，；：、）就提交
                 first_sentence_min_chars = self._read_int_env(
                     "OPENTALKING_CHAT_FIRST_SENT_MIN_CHARS", 6
@@ -1954,24 +1965,46 @@ class SessionRunner:
                             )
                             first_token_marked = True
                         full_response_parts.append(delta)
-                        for sentence in splitter.feed(delta):
-                            first_sentence_committed = True
-                            if chunk_idx == 0:
-                                parts = split_first_sentence(sentence)
+                        text_delta = delta
+                        if not cosyvoice3_detection_done:
+                            cosyvoice3_pending_prefix += delta
+                            if cosyvoice3_separator in cosyvoice3_pending_prefix:
+                                instruction, _, rest = cosyvoice3_pending_prefix.partition(cosyvoice3_separator)
+                                instruction = instruction.strip()
+                                if instruction:
+                                    cosyvoice3_instruction_prefix = f"{instruction}{cosyvoice3_separator}"
+                                text_delta = rest
+                                cosyvoice3_pending_prefix = ""
+                                cosyvoice3_detection_done = True
+                            elif len(cosyvoice3_pending_prefix) < 256:
+                                continue
                             else:
-                                parts = [sentence]
-                            for part in parts:
-                                await _enqueue_sentence(part)
+                                text_delta = cosyvoice3_pending_prefix
+                                cosyvoice3_pending_prefix = ""
+                                cosyvoice3_detection_done = True
+                        if text_delta:
+                            for sentence in splitter.feed(text_delta):
+                                first_sentence_committed = True
+                                if chunk_idx == 0:
+                                    parts = split_first_sentence(sentence)
+                                else:
+                                    parts = [sentence]
+                                for part in parts:
+                                    await _enqueue_sentence(part)
+                                    if self._interrupt.is_set():
+                                        break
                                 if self._interrupt.is_set():
                                     break
-                            if self._interrupt.is_set():
-                                break
-                        if not first_sentence_committed:
+                        if cosyvoice3_detection_done and not first_sentence_committed:
                             early = _try_commit_first_sentence()
                             if early:
                                 first_sentence_committed = True
                                 await _enqueue_sentence(early)
                     if not self._interrupt.is_set():
+                        if not cosyvoice3_detection_done and cosyvoice3_pending_prefix:
+                            for sentence in splitter.feed(cosyvoice3_pending_prefix):
+                                first_sentence_committed = True
+                                await _enqueue_sentence(sentence)
                         tail = splitter.flush()
                         if tail:
                             await _enqueue_sentence(tail)

@@ -39,3 +39,22 @@ def test_flashhead_maps_shared_paths(tmp_path: Path) -> None:
     mapped = client._map_remote_path_to_local("/mnt/shared/out/result.mp4")
 
     assert mapped == (local / "out" / "result.mp4").resolve()
+
+
+async def test_flashhead_init_session_ignores_runner_metadata(tmp_path: Path) -> None:
+    client = FlashHeadHTTPClient(
+        base_url="http://example.test",
+        shared_local_dir=str(tmp_path / "shared"),
+        shared_remote_dir="/mnt/shared",
+    )
+
+    init = await client.init_session(
+        b"fake-image",
+        wav2lip_postprocess_mode="basic",
+        mouth_metadata={"version": 1},
+        video_config={"fps": 25},
+    )
+
+    assert init["model"] == "soulx-flashhead-1.3b"
+    assert client._ref_image_remote_path.endswith("/reference.png")
+    await client.close()

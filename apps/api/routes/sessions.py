@@ -66,6 +66,7 @@ from opentalking.pipeline.recording.recording import (
 )
 from opentalking.persona.session import build_session_defaults
 from opentalking.persona.store import PersonaStore
+from opentalking.providers.rtc.aiortc.adapter import get_webrtc_ice_config_payload
 
 
 def _effective_tts_provider(requested: str | None) -> str:
@@ -341,6 +342,11 @@ async def _stream_worker_flashtalk_recording(
 
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
+
+
+@router.get("/webrtc/ice-config")
+async def webrtc_ice_config() -> dict[str, object]:
+    return get_webrtc_ice_config_payload()
 
 
 async def _flashtalk_disk_recording_control(
@@ -1204,8 +1210,19 @@ async def speak_audio_stream_ws(websocket: WebSocket, session_id: str) -> None:
         return
 
     sq: sync_queue.Queue[bytes | None] = sync_queue.Queue()
+    transcript_events: sync_queue.Queue[dict[str, Any] | None] = sync_queue.Queue()
     pcm_rx_stats: dict[str, int] = {"bytes": 0}
     t_stream0 = time.perf_counter()
+    send_lock = asyncio.Lock()
+
+    async def send_json_safe(payload: dict[str, Any]) -> None:
+        with contextlib.suppress(WebSocketDisconnect, RuntimeError):
+            async with send_lock:
+                await websocket.send_json(payload)
+
+    async def close_safe(code: int) -> None:
+        with contextlib.suppress(WebSocketDisconnect, RuntimeError):
+            await websocket.close(code=code)
 
     async def pump() -> None:
         try:
@@ -1231,6 +1248,21 @@ async def speak_audio_stream_ws(websocket: WebSocket, session_id: str) -> None:
             sq.put(None)
 
     pump_task = asyncio.create_task(pump())
+    transcript_task: asyncio.Task[None] | None = None
+
+    async def forward_transcript_events() -> None:
+        while True:
+            event = await asyncio.to_thread(transcript_events.get)
+            if event is None:
+                return
+            try:
+                await send_json_safe(event)
+            except Exception:
+                return
+
+    if (requested_stt_provider or "").strip().lower() in {"", "dashscope"}:
+        transcript_task = asyncio.create_task(forward_transcript_events())
+
     text = ""
     dashscope_ms = 0.0
     try:
@@ -1239,6 +1271,7 @@ async def speak_audio_stream_ws(websocket: WebSocket, session_id: str) -> None:
                 transcribe_pcm_chunk_queue_sync,
                 sq,
                 provider=requested_stt_provider,
+                event_queue=transcript_events,
             ),
             timeout=120.0,
         )
@@ -1249,21 +1282,25 @@ async def speak_audio_stream_ws(websocket: WebSocket, session_id: str) -> None:
             pcm_rx_stats["bytes"],
         )
         try:
-            await websocket.send_json({"error": "语音识别超时，请重试。"})
+            await send_json_safe({"type": "error", "error": "语音识别超时，请重试。"})
         except Exception:
             pass
-        await websocket.close(code=4408)
+        await close_safe(code=4408)
         return
     except RuntimeError as e:
-        await websocket.send_json({"error": str(e)})
-        await websocket.close(code=4400)
+        await send_json_safe({"type": "error", "error": str(e)})
+        await close_safe(code=4400)
         return
     except Exception as e:  # noqa: BLE001
         log.exception("speak_audio_stream stt failed")
-        await websocket.send_json({"error": f"stt error: {e}"})
-        await websocket.close(code=1011)
+        await send_json_safe({"type": "error", "error": f"stt error: {e}"})
+        await close_safe(code=1011)
         return
     finally:
+        transcript_events.put(None)
+        if transcript_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await transcript_task
         pump_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await pump_task
@@ -1280,9 +1317,10 @@ async def speak_audio_stream_ws(websocket: WebSocket, session_id: str) -> None:
 
     stripped = text.strip()
     if not stripped:
-        await websocket.send_json({"error": "未能识别有效语音，请重试。"})
+        await send_json_safe({"type": "error", "error": "未能识别有效语音，请重试。"})
         await websocket.close(code=4400)
         return
+    await send_json_safe({"type": "transcript.final", "text": stripped, "is_final": True})
 
     await session_service.speak(
         r,
@@ -1292,7 +1330,7 @@ async def speak_audio_stream_ws(websocket: WebSocket, session_id: str) -> None:
         tts_provider=eff_prov,
         tts_model=tm,
     )
-    await websocket.send_json({"session_id": session_id, "status": "queued", "text": stripped})
+    await send_json_safe({"type": "speak.queued", "session_id": session_id, "status": "queued", "text": stripped})
 
 
 @router.post("/{session_id}/interrupt")

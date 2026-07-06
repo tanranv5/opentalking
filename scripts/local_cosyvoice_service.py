@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import io
 import os
@@ -18,6 +19,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+COSYVOICE3_END_OF_PROMPT = "<|endofprompt|>"
+COSYVOICE3_PROMPT_PREFIX = "You are a helpful assistant."
 
 
 def _soundfile_load_wav(wav: str, target_sr: int):
@@ -403,6 +406,12 @@ class CosyVoiceService:
         self._flow_tuning: dict[str, Any] = {}
         self._llm_token_ratio_tuning: dict[str, Any] = {}
         self._llm_stop_token_patch: dict[str, Any] = {}
+        # Cache of registered zero-shot speakers: fingerprint -> spk_id in the
+        # engine's spk2info. Lets repeat requests skip prompt-audio feature
+        # extraction (whisper speech-token + campplus embedding + speech-feat),
+        # which is the fixed cost dominating first-packet latency.
+        self._zero_shot_spk_cache: dict[str, str] = {}
+        self._zero_shot_spk_lock = threading.Lock()
 
     def model(self) -> Any:
         if self._model is not None:
@@ -544,13 +553,60 @@ class CosyVoiceService:
         out = np.interp(xi, np.arange(pcm.size), pcm_f)
         return np.clip(np.round(out * 32768.0), -32768, 32767).astype(np.int16)
 
+    def _zero_shot_spk_id(self, model: Any, prompt_audio: str, clean_prompt_text: str) -> str:
+        """Register (once) a zero-shot speaker so repeat requests skip prompt-audio
+        feature extraction (whisper speech-token + campplus embedding + speech-feat).
+
+        Returns the spk_id to pass to inference_zero_shot, or "" to fall back to the
+        original per-request extraction path on any failure — keeping behaviour
+        identical to the pre-cache code when registration is unavailable.
+        """
+        register = getattr(model, "add_zero_shot_spk", None)
+        if not callable(register) or not prompt_audio:
+            return ""
+        try:
+            stat = os.stat(prompt_audio)
+        except OSError:
+            return ""
+        fingerprint = hashlib.sha1(
+            f"{os.path.abspath(prompt_audio)}|{stat.st_mtime_ns}|{stat.st_size}|{clean_prompt_text}".encode("utf-8")
+        ).hexdigest()
+        cached = self._zero_shot_spk_cache.get(fingerprint)
+        if cached is not None:
+            return cached
+        with self._zero_shot_spk_lock:
+            cached = self._zero_shot_spk_cache.get(fingerprint)
+            if cached is not None:
+                return cached
+            spk_id = f"otcache_{fingerprint[:16]}"
+            try:
+                with self._model_lock:
+                    result = register(clean_prompt_text, prompt_audio, spk_id)
+            except Exception as exc:  # noqa: BLE001 — cache is best-effort; fall back on any error
+                print(f"zero_shot spk cache register failed: {exc!r}", flush=True)
+                return ""
+            if result is False:
+                return ""
+            self._zero_shot_spk_cache[fingerprint] = spk_id
+            print(f"zero_shot spk cached spk_id={spk_id}", flush=True)
+            return spk_id
+
     def _prompt_text_for_zero_shot(self, prompt_text: str) -> str:
         text = prompt_text.strip()
-        if "<|endofprompt|>" in text:
+        if COSYVOICE3_END_OF_PROMPT in text:
+            text = text.rsplit(COSYVOICE3_END_OF_PROMPT, 1)[-1].strip()
+        if text and "cosyvoice3" in self.model_dir.lower():
+            return f"{COSYVOICE3_PROMPT_PREFIX}{COSYVOICE3_END_OF_PROMPT}{text}"
+        return text
+
+    def _instruction_for_instruct(self, instruction: str) -> str:
+        text = instruction.strip()
+        if not text:
             return text
-        if text:
-            return f"You are a helpful assistant.<|endofprompt|>{text}"
-        return "You are a helpful assistant.<|endofprompt|>"
+        if COSYVOICE3_END_OF_PROMPT in text:
+            instruction_text, _, _ = text.partition(COSYVOICE3_END_OF_PROMPT)
+            text = instruction_text.strip()
+        return f"{text}{COSYVOICE3_END_OF_PROMPT}" if text else COSYVOICE3_END_OF_PROMPT
 
     def synthesize_wav(self, req: SynthesizeRequest) -> tuple[bytes, int, float]:
         text = req.text.strip()
@@ -569,7 +625,7 @@ class CosyVoiceService:
         elif mode == "instruct":
             if not prompt_audio:
                 raise HTTPException(status_code=400, detail="prompt_audio is required")
-            instruction = (req.instruction or self.instruction).strip()
+            instruction = self._instruction_for_instruct(req.instruction or self.instruction)
             iterator = model.inference_instruct2(text, instruction, prompt_audio, stream=False)
         else:
             if not prompt_audio or not prompt_text:
@@ -577,10 +633,15 @@ class CosyVoiceService:
                     status_code=400,
                     detail="zero_shot mode requires prompt_audio and prompt_text",
                 )
+            clean_prompt_text = self._prompt_text_for_zero_shot(prompt_text)
+            if not clean_prompt_text:
+                raise HTTPException(status_code=400, detail="zero_shot prompt_text is empty after sanitization")
+            spk_id = self._zero_shot_spk_id(model, prompt_audio, clean_prompt_text)
             iterator = model.inference_zero_shot(
                 text,
-                self._prompt_text_for_zero_shot(prompt_text),
+                clean_prompt_text,
                 prompt_audio,
+                zero_shot_spk_id=spk_id,
                 stream=False,
             )
         parts: list[np.ndarray] = []
@@ -613,7 +674,7 @@ class CosyVoiceService:
         elif mode == "instruct":
             if not prompt_audio:
                 raise HTTPException(status_code=400, detail="prompt_audio is required")
-            instruction = (req.instruction or self.instruction).strip()
+            instruction = self._instruction_for_instruct(req.instruction or self.instruction)
             iterator = model.inference_instruct2(text, instruction, prompt_audio, stream=True)
         else:
             if not prompt_audio or not prompt_text:
@@ -621,10 +682,15 @@ class CosyVoiceService:
                     status_code=400,
                     detail="zero_shot mode requires prompt_audio and prompt_text",
                 )
+            clean_prompt_text = self._prompt_text_for_zero_shot(prompt_text)
+            if not clean_prompt_text:
+                raise HTTPException(status_code=400, detail="zero_shot prompt_text is empty after sanitization")
+            spk_id = self._zero_shot_spk_id(model, prompt_audio, clean_prompt_text)
             iterator = model.inference_zero_shot(
                 text,
-                self._prompt_text_for_zero_shot(prompt_text),
+                clean_prompt_text,
                 prompt_audio,
+                zero_shot_spk_id=spk_id,
                 stream=True,
             )
         return iterator, source_sr, target_sr, t0, model
@@ -748,7 +814,7 @@ def build_service_from_env() -> CosyVoiceService:
         mode=os.environ.get("OPENTALKING_TTS_LOCAL_COSYVOICE_MODE", "zero_shot"),
         instruction=os.environ.get(
             "OPENTALKING_TTS_LOCAL_COSYVOICE_INSTRUCTION",
-            "You are a helpful assistant.<|endofprompt|>",
+            "",
         ),
         fp16=fp16,
         load_jit=_env_bool("OPENTALKING_TTS_LOCAL_COSYVOICE_LOAD_JIT", False),

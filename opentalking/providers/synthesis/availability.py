@@ -123,6 +123,18 @@ async def _is_direct_ws_reachable(url: str) -> bool:
             return False
 
 
+async def _is_flashhead_http_reachable(base_url: str) -> bool:
+    base_url = base_url.strip().rstrip("/")
+    if not base_url:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=1.0) as client:
+            response = await client.get(f"{base_url}/health")
+            return response.status_code < 500
+    except Exception:
+        return False
+
+
 async def resolve_model_statuses(settings) -> list[ModelStatus]:
     omnirt_models = await _fetch_omnirt_audio2video_models(settings)
     has_omnirt = bool((getattr(settings, "omnirt_endpoint", "") or "").strip())
@@ -148,7 +160,11 @@ async def resolve_model_statuses(settings) -> list[ModelStatus]:
             else:
                 reason = "not_configured"
         elif resolved.backend == "direct_ws":
-            if resolved.ws_url:
+            if model == "flashhead":
+                base_url = str(getattr(settings, "flashhead_base_url", "") or "").strip()
+                connected = await _is_flashhead_http_reachable(base_url)
+                reason = "flashhead_http" if connected else "flashhead_http_unavailable"
+            elif resolved.ws_url:
                 connected = await _is_direct_ws_reachable(resolved.ws_url)
                 reason = "direct_ws" if connected else "direct_ws_unavailable"
             else:

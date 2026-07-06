@@ -16,6 +16,10 @@ import numpy as np
 from opentalking.core.types.frames import AudioChunk
 
 
+COSYVOICE3_END_OF_PROMPT = "<|endofprompt|>"
+DEFAULT_COSYVOICE3_INSTRUCTION = "请始终使用标准普通话中文自然清晰地朗读，不要翻译，不要使用英文、外文、颜文字或表情符号。"
+
+
 def _settings_value(name: str, default: str = "") -> str:
     try:
         from opentalking.core.config import get_settings
@@ -108,35 +112,60 @@ def _resolve_model_path(model: str) -> str:
     return str(_model_root() / model.replace("/", "__"))
 
 
+def _resolve_default_local_voice_prompt() -> dict[str, str] | None:
+    for base in (_model_root() / "voices" / "clones", _model_root() / "voices" / "system"):
+        if not base.is_dir():
+            continue
+        for voice_dir in sorted(base.iterdir()):
+            voice_prompt = _load_local_voice_prompt(voice_dir)
+            if voice_prompt is not None:
+                return voice_prompt
+    return None
+
+
+def _load_local_voice_prompt(voice_dir: Path) -> dict[str, str] | None:
+    prompt_audio = voice_dir / "prompt.wav"
+    prompt_text = voice_dir / "prompt.txt"
+    if not prompt_audio.is_file() or not prompt_text.is_file():
+        return None
+    result = {"prompt_audio": str(prompt_audio)}
+    text = prompt_text.read_text(encoding="utf-8").strip()
+    if text:
+        result["prompt_text"] = text
+    meta_path = voice_dir / "meta.json"
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+        for key in ("mode", "instruction"):
+            value = str(meta.get(key) or "").strip()
+            if value:
+                result[key] = value
+    return result if (result.get("prompt_text") or result.get("mode") or result.get("instruction")) else None
+
+
 def _resolve_local_voice_prompt(voice: str | None) -> dict[str, str] | None:
     voice_id = (voice or "").strip()
     if not voice_id or voice_id == "local-default":
-        return None
+        return _resolve_default_local_voice_prompt()
     if not all(ch.isalnum() or ch in {"_", "-"} for ch in voice_id):
-        return None
+        return _resolve_default_local_voice_prompt()
     for base in (_model_root() / "voices" / "clones", _model_root() / "voices" / "system"):
-        voice_dir = base / voice_id
-        prompt_audio = voice_dir / "prompt.wav"
-        prompt_text = voice_dir / "prompt.txt"
-        if not prompt_audio.is_file() or not prompt_text.is_file():
-            continue
-        result = {"prompt_audio": str(prompt_audio)}
-        text = prompt_text.read_text(encoding="utf-8").strip()
-        if text:
-            result["prompt_text"] = text
-        meta_path = voice_dir / "meta.json"
-        if meta_path.is_file():
-            try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except Exception:
-                meta = {}
-            for key in ("mode", "instruction"):
-                value = str(meta.get(key) or "").strip()
-                if value:
-                    result[key] = value
-        if result.get("prompt_text") or result.get("mode") in {"cross_lingual", "instruct"}:
-            return result
-    return None
+        voice_prompt = _load_local_voice_prompt(base / voice_id)
+        if voice_prompt is not None:
+            return voice_prompt
+    return _resolve_default_local_voice_prompt()
+
+
+def _split_cosyvoice3_instruction(text: str) -> tuple[str, str]:
+    raw = text.strip()
+    if COSYVOICE3_END_OF_PROMPT in raw:
+        instruction, _, reply = raw.partition(COSYVOICE3_END_OF_PROMPT)
+        instruction = instruction.strip() or DEFAULT_COSYVOICE3_INSTRUCTION
+        reply = reply.strip() or raw
+        return reply, f"{instruction}{COSYVOICE3_END_OF_PROMPT}"
+    return raw, ""
 
 
 def _env_device() -> str:
@@ -270,6 +299,7 @@ class LocalCosyVoiceTTSAdapter:
         chunk_ms: float = 20.0,
         *,
         model: str | None = None,
+        service_url: str | None = None,
     ) -> None:
         self.default_voice = default_voice or "local-default"
         self.sample_rate = sample_rate
@@ -289,14 +319,18 @@ class LocalCosyVoiceTTSAdapter:
             os.environ.get("OPENTALKING_TTS_LOCAL_COSYVOICE_RUNTIME_DIR", "").strip()
             or _settings_value("tts_local_cosyvoice_runtime_dir", "")
         )
-        default_service_url = (
+        explicit_service_url = (service_url or "").strip()
+        default_service_url = explicit_service_url or (
             os.environ.get("OPENTALKING_TTS_LOCAL_COSYVOICE_SERVICE_URL", "").strip()
             or _settings_value("tts_local_cosyvoice_service_url", "")
         )
-        self.service_url = _resolve_service_url_for_model(
-            self.model,
-            self.default_model,
-            default_service_url,
+        self.service_url = (
+            explicit_service_url
+            or _resolve_service_url_for_model(
+                self.model,
+                self.default_model,
+                default_service_url,
+            )
         )
         self.device = _env_device()
         self.fp16 = _local_cosyvoice_fp16(self.device)
@@ -322,8 +356,20 @@ class LocalCosyVoiceTTSAdapter:
 
     async def _synthesize_via_service(self, text: str, voice: str | None = None) -> AsyncIterator[AudioChunk]:
         timeout = httpx.Timeout(connect=30.0, read=180.0, write=30.0, pool=30.0)
+        raw_text = text.strip()
+        instruction_text = ""
+        if "cosyvoice3" in self.model.lower():
+            raw_text, instruction_text = _split_cosyvoice3_instruction(raw_text)
+        try:
+            from opentalking.pipeline.speak.text_sanitize import sanitize_tts_text
+
+            tts_text = sanitize_tts_text(raw_text)
+        except Exception:
+            tts_text = raw_text
+        if not tts_text:
+            return
         payload = {
-            "text": text,
+            "text": tts_text,
             "voice": voice or self.default_voice,
             "model": self.model,
             "sample_rate": self.sample_rate,
@@ -331,6 +377,13 @@ class LocalCosyVoiceTTSAdapter:
         local_prompt = _resolve_local_voice_prompt(voice or self.default_voice)
         if local_prompt is not None:
             payload.update(local_prompt)
+        if instruction_text:
+            payload["mode"] = "instruct"
+            payload["instruction"] = instruction_text
+        elif "cosyvoice3" in self.model.lower():
+            prompt_text = str(payload.get("prompt_text") or "").strip()
+            if prompt_text and COSYVOICE3_END_OF_PROMPT not in prompt_text:
+                payload["prompt_text"] = f"{DEFAULT_COSYVOICE3_INSTRUCTION}{COSYVOICE3_END_OF_PROMPT}{prompt_text}"
         async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream("POST", self.service_url, json=payload) as resp:
                 resp.raise_for_status()
@@ -412,7 +465,7 @@ class LocalCosyVoiceTTSAdapter:
         }
         model_lower = self.model.lower()
         if "cosyvoice3" in model_lower:
-            cls = getattr(cosyvoice_module, "AutoModel")
+            cls = getattr(cosyvoice_module, "CosyVoice3")
         elif "cosyvoice2" in model_lower:
             cls = getattr(cosyvoice_module, "CosyVoice2")
         else:
@@ -434,13 +487,26 @@ class LocalCosyVoiceTTSAdapter:
 
     def _synthesize_in_process(self, text: str, voice: str) -> list[AudioChunk]:
         engine = self._load_engine()
-        spk_id = self._available_voice(engine, voice)
-        infer = getattr(engine, "inference_sft", None)
-        if not callable(infer):
-            raise RuntimeError("CosyVoice runtime does not expose inference_sft().")
         sr = int(getattr(engine, "sample_rate", 22050) or 22050)
         pcm_parts: list[np.ndarray] = []
-        for item in infer(text, spk_id, stream=False):
+        local_prompt = _resolve_local_voice_prompt(voice)
+        infer_instruct2 = getattr(engine, "inference_instruct2", None)
+        if callable(infer_instruct2) and local_prompt is not None:
+            tts_text, instruct_text = _split_cosyvoice3_instruction(text)
+            iterator = infer_instruct2(
+                tts_text,
+                instruct_text,
+                local_prompt["prompt_audio"],
+                stream=False,
+                text_frontend=True,
+            )
+        else:
+            spk_id = self._available_voice(engine, voice)
+            infer_sft = getattr(engine, "inference_sft", None)
+            if not callable(infer_sft):
+                raise RuntimeError("CosyVoice runtime does not expose an available synthesis method.")
+            iterator = infer_sft(text, spk_id, stream=False)
+        for item in iterator:
             speech = item.get("tts_speech") if isinstance(item, dict) else item
             if hasattr(speech, "detach"):
                 speech = speech.detach().cpu().numpy()

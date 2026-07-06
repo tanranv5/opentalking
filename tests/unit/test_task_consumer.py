@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from apps.api.services import session_service
+from opentalking.core.config import get_settings
 from opentalking.core.in_memory_redis import InMemoryRedis
 from opentalking.core.redis_keys import TASK_QUEUE
 from opentalking.core.session_store import get_session_record, session_key
@@ -371,6 +372,56 @@ def test_create_runner_wraps_omnirt_ws_client_in_audio2video_client(
     assert audio2video_client.ws_client.ws_url == "ws://omnirt.test/v1/audio2video/wav2lip"
     assert audio2video_client.ws_client.extra_headers == {"Authorization": "Bearer test"}
     assert "flashtalk_client" not in captured
+
+
+
+def test_create_runner_uses_flashhead_http_client_for_direct_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeFlashTalkRunner:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    class FakeAudio2VideoClient:
+        def __init__(self, ws_client: object) -> None:
+            self.ws_client = ws_client
+
+    class FakeFlashHeadHTTPClient:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+    class FakeFlashHeadWSClient:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+    monkeypatch.setenv("OPENTALKING_FLASHHEAD_BASE_URL", "http://127.0.0.1:8766")
+    get_settings.cache_clear()
+    monkeypatch.setattr("opentalking.runtime.task_consumer.FlashTalkRunner", FakeFlashTalkRunner)
+    monkeypatch.setattr("opentalking.runtime.task_consumer.OmniRTAudio2VideoClient", FakeAudio2VideoClient)
+    monkeypatch.setattr("opentalking.providers.synthesis.flashhead.FlashHeadHTTPClient", FakeFlashHeadHTTPClient)
+    monkeypatch.setattr("opentalking.providers.synthesis.flashhead.FlashHeadWSClient", FakeFlashHeadWSClient)
+    monkeypatch.setattr(
+        task_consumer,
+        "resolve_model_backend",
+        lambda *_args, **_kwargs: type("Backend", (), {"backend": "direct_ws", "ws_url": ""})(),
+    )
+
+    runner = task_consumer._create_runner(
+        {"session_id": "sess_flashhead", "avatar_id": "singer", "model": "flashhead"},
+        InMemoryRedis(),
+        Path("examples/avatars"),
+        "cpu",
+    )
+
+    assert isinstance(runner, FakeFlashTalkRunner)
+    audio2video_client = captured["audio2video_client"]
+    assert isinstance(audio2video_client, FakeAudio2VideoClient)
+    assert isinstance(audio2video_client.ws_client, FakeFlashHeadHTTPClient)
+    assert audio2video_client.ws_client.kwargs["base_url"] == "http://127.0.0.1:8766"
+    assert captured["model_type"] == "flashhead"
+    get_settings.cache_clear()
 
 
 def test_create_runner_wraps_musetalk_omnirt_in_audio2video_client(

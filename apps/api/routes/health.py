@@ -28,6 +28,16 @@ _IGNORED_LEGACY_ENV = (
 )
 
 
+def _safe_provider_config_map(providers: list[str], loader: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for provider in providers:
+        try:
+            result[provider] = loader(provider)
+        except ValueError:
+            continue
+    return result
+
+
 def _runtime_status_payload(request: Request) -> dict[str, Any]:
     settings = request.app.state.settings
     stt = stt_status()
@@ -41,7 +51,7 @@ def _runtime_status_payload(request: Request) -> dict[str, Any]:
     for provider in ("sensevoice", "dashscope", "xiaomi_mimo", "openai_compatible"):
         if provider not in stt_status_providers:
             stt_status_providers.append(provider)
-    stt_provider_map = {provider: stt_provider_config(provider) for provider in stt_status_providers}
+    stt_provider_map = _safe_provider_config_map(stt_status_providers, stt_provider_config)
     stt_effective = stt_provider_map.get(stt_provider, stt)
     tts = tts_status()
     tts_provider = str(tts.get("provider", ""))
@@ -50,8 +60,10 @@ def _runtime_status_payload(request: Request) -> dict[str, Any]:
         tts_provider_list = [tts_provider, *tts_provider_list]
     tts_status_providers = [*tts_provider_list]
     for provider in (
+        "mock",
         "local_cosyvoice",
         "indextts",
+        "local_f5_tts",
         "dashscope",
         "xiaomi_mimo",
         "openai_compatible",
@@ -61,11 +73,13 @@ def _runtime_status_payload(request: Request) -> dict[str, Any]:
     ):
         if provider not in tts_status_providers:
             tts_status_providers.append(provider)
-    tts_provider_map = {provider: tts_provider_config(provider) for provider in tts_status_providers}
+    tts_provider_map = _safe_provider_config_map(tts_status_providers, tts_provider_config)
     tts_effective = tts_provider_map.get(tts_provider, tts)
-    llm_key = os.environ.get("OPENTALKING_LLM_API_KEY", "").strip() or str(
-        getattr(settings, "llm_api_key", "") or ""
-    ).strip()
+    llm_key = (
+        os.environ.get("OPENTALKING_LLM_API_KEY", "").strip()
+        or os.environ.get("DASHSCOPE_API_KEY", "").strip()
+        or str(getattr(settings, "llm_api_key", "") or "").strip()
+    )
     ignored_legacy_env = [name for name in _IGNORED_LEGACY_ENV if os.environ.get(name)]
     quicktalk_backend = os.environ.get("OPENTALKING_QUICKTALK_BACKEND", "").strip() or str(
         getattr(settings, "quicktalk_backend", "") or ""
@@ -125,8 +139,13 @@ async def runtime_status(request: Request) -> dict[str, Any]:
 
 
 @router.get("/queue/status")
-async def queue_status(request: Request) -> dict[str, bool | int]:
+async def queue_status(request: Request) -> dict[str, bool | int | str | list[str]]:
     try:
         return await get_flashtalk_queue_status(request.app.state.redis)
     except Exception:
-        return {"slot_occupied": False, "queue_size": 0}
+        return {
+            "slot_occupied": False,
+            "queue_size": 0,
+            "active_session_id": "",
+            "queued_session_ids": [],
+        }

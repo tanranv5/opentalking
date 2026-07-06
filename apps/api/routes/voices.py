@@ -79,6 +79,13 @@ def _safe_local_voice_id(label: str) -> str:
     return f"local-{slug}-{uuid.uuid4().hex[:8]}"
 
 
+def _clean_local_cosyvoice_prompt_text(prompt_text: str) -> str:
+    text = (prompt_text or "").strip()
+    if "<|endofprompt|>" in text:
+        text = text.rsplit("<|endofprompt|>", 1)[-1].strip()
+    return text or LOCAL_COSYVOICE_SAMPLE_TEXT
+
+
 def _write_local_cosyvoice_prompt(
     *,
     voice_id: str,
@@ -92,8 +99,9 @@ def _write_local_cosyvoice_prompt(
         raise ValueError("invalid local voice id")
     voice_dir = _local_audio_model_root() / "voices" / "clones" / voice_id
     voice_dir.mkdir(parents=True, exist_ok=True)
+    clean_prompt_text = _clean_local_cosyvoice_prompt_text(prompt_text)
     (voice_dir / "prompt.wav").write_bytes(wav)
-    (voice_dir / "prompt.txt").write_text(prompt_text.strip() or LOCAL_COSYVOICE_SAMPLE_TEXT, encoding="utf-8")
+    (voice_dir / "prompt.txt").write_text(clean_prompt_text, encoding="utf-8")
     (voice_dir / "meta.json").write_text(
         json.dumps(
             {
@@ -102,7 +110,7 @@ def _write_local_cosyvoice_prompt(
                 "provider": "local_cosyvoice",
                 "target_model": target_model,
                 "prompt_audio": str(voice_dir / "prompt.wav"),
-                "prompt_text": prompt_text.strip() or LOCAL_COSYVOICE_SAMPLE_TEXT,
+                "prompt_text": clean_prompt_text,
                 "validation": validation or {},
                 "source": "clone",
             },
@@ -278,8 +286,10 @@ def _system_voice_roots() -> list[Path]:
     return out
 
 
-def _local_cosyvoice_system_voice_items() -> list[VoiceItem]:
-    root = _local_audio_model_root() / "voices" / "system"
+def _local_cosyvoice_voice_items(source: str) -> list[VoiceItem]:
+    if source not in {"system", "clones"}:
+        return []
+    root = _local_audio_model_root() / "voices" / source
     if not root.is_dir():
         return []
     items: list[VoiceItem] = []
@@ -308,10 +318,18 @@ def _local_cosyvoice_system_voice_items() -> list[VoiceItem]:
                 "voice_id": voice_id,
                 "display_label": label,
                 "target_model": target_model,
-                "source": "system",
+                "source": "clone" if source == "clones" else "system",
             }
         )
     return items
+
+
+def _local_cosyvoice_system_voice_items() -> list[VoiceItem]:
+    return _local_cosyvoice_voice_items("system")
+
+
+def _local_cosyvoice_clone_voice_items() -> list[VoiceItem]:
+    return _local_cosyvoice_voice_items("clones")
 
 
 def _local_indextts_voice_items(provider: str, source: str) -> list[VoiceItem]:
@@ -423,7 +441,7 @@ async def get_voices(provider: str | None = None) -> JSONResponse:
             item["profile"] = profile  # type: ignore[typeddict-unknown-key]
         items.append(item)
     if public_p in {None, "local_cosyvoice"}:
-        for item in _local_cosyvoice_system_voice_items():
+        for item in [*_local_cosyvoice_system_voice_items(), *_local_cosyvoice_clone_voice_items()]:
             key = (item["provider"], item["voice_id"])
             if key not in existing:
                 items.append(item)
@@ -533,7 +551,7 @@ async def post_voice_clone(
 
         if prov == "local_cosyvoice":
             voice_id = _safe_local_voice_id(label)
-            clean_prompt_text = (prompt_text or "").strip() or LOCAL_COSYVOICE_SAMPLE_TEXT
+            clean_prompt_text = _clean_local_cosyvoice_prompt_text(prompt_text)
             validation = await _validate_local_cosyvoice_prompt(wav, clean_prompt_text)
             _write_local_cosyvoice_prompt(
                 voice_id=voice_id,

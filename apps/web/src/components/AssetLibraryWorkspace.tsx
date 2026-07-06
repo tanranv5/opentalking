@@ -4,6 +4,7 @@ import {
   apiDelete,
   apiGet,
   apiPost,
+  apiPostBlob,
   apiPostForm,
   buildApiDownloadUrl,
   buildApiUrl,
@@ -15,6 +16,7 @@ import {
   uploadSceneBackground,
   type AvatarSummary,
   type ExportVideoItem,
+  type VoiceCatalogItem,
   type KnowledgeBaseSummary,
   type KnowledgeBasesResponse,
   type KnowledgeDocument,
@@ -25,7 +27,7 @@ import {
 import { MemoryPanel } from "./MemoryPanel";
 import type { MemoryLibrary } from "../types";
 
-type AssetTab = "exports" | "knowledge" | "memory" | "scenes" | "voices";
+type AssetTab = "exports" | "avatars" | "knowledge" | "memory" | "scenes" | "voices";
 export type AssetLibraryTab = AssetTab;
 
 type AssetLibraryWorkspaceProps = {
@@ -51,12 +53,20 @@ type AssetLibraryWorkspaceProps = {
   onSceneBackgroundsChange?: (backgrounds: SceneBackgroundAsset[]) => void;
 };
 
+type TTSPreviewPayload = {
+  text: string;
+  voice: string;
+  tts_provider: string;
+  tts_model?: string;
+};
+
 const ASSET_TABS: { id: AssetTab; label: string; disabled?: boolean }[] = [
   { id: "exports", label: "导出视频" },
+  { id: "avatars", label: "数字人资产" },
   { id: "knowledge", label: "知识库" },
   { id: "memory", label: "记忆库" },
   { id: "scenes", label: "场景资产" },
-  { id: "voices", label: "声音资产", disabled: true },
+  { id: "voices", label: "声音资产" },
 ];
 
 const KIND_LABELS: Record<ExportVideoItem["kind"], string> = {
@@ -65,11 +75,20 @@ const KIND_LABELS: Record<ExportVideoItem["kind"], string> = {
   video_creation: "视频创作",
 };
 
-const KNOWLEDGE_FILE_ACCEPT = ".txt,.md,.markdown,.pdf,text/plain,text/markdown,application/pdf";
-const KNOWLEDGE_FILE_EXTENSIONS = new Set([".txt", ".md", ".markdown", ".pdf"]);
-const KNOWLEDGE_FILE_FORMAT_LABEL = ".txt、.md、.markdown、.pdf";
+const KNOWLEDGE_FILE_ACCEPT = ".txt,.md,.markdown,.pdf,.pptx,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation";
+const KNOWLEDGE_FILE_EXTENSIONS = new Set([".txt", ".md", ".markdown", ".pdf", ".pptx"]);
+const KNOWLEDGE_FILE_FORMAT_LABEL = ".txt、.md、.markdown、.pdf、.pptx";
 const KNOWLEDGE_FILE_HINT = `支持格式：${KNOWLEDGE_FILE_FORMAT_LABEL}`;
 const KNOWLEDGE_FILE_UNSUPPORTED_MESSAGE = `仅支持 ${KNOWLEDGE_FILE_FORMAT_LABEL} 文件，已忽略不支持的文件。`;
+const SUPPORTED_LOCAL_COSYVOICE_PROVIDER = "local_cosyvoice";
+const SUPPORTED_LOCAL_COSYVOICE_MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512";
+const LOCAL_COSYVOICE_PREVIEW_TEXT = "你好，我正在用标准普通话中文测试这个声音资产。请清晰自然地朗读这句话。";
+
+function isSupportedLocalCosyVoiceClone(voice: VoiceCatalogItem): boolean {
+  return voice.provider === SUPPORTED_LOCAL_COSYVOICE_PROVIDER
+    && voice.target_model === SUPPORTED_LOCAL_COSYVOICE_MODEL
+    && voice.source === "clone";
+}
 
 function formatDuration(seconds: number | null): string {
   if (seconds == null || !Number.isFinite(seconds) || seconds <= 0) return "-";
@@ -282,9 +301,31 @@ export function AssetLibraryWorkspace({
   const [sceneBackgroundId, setSceneBackgroundId] = useState("");
   const [backgroundName, setBackgroundName] = useState("");
   const [backgroundFile, setBackgroundFile] = useState<File | null>(null);
+  const [assetAvatars, setAssetAvatars] = useState<AvatarSummary[]>(avatars ?? []);
+  const [assetAvatarLoading, setAssetAvatarLoading] = useState(false);
+  const [assetAvatarError, setAssetAvatarError] = useState<string | null>(null);
+  const [avatarName, setAvatarName] = useState("");
+  const [avatarModel, setAvatarModel] = useState("quicktalk");
+  const [avatarFile, setAvatarFile] = useState<File | null>(null);
+  const [avatarUploading, setAvatarUploading] = useState(false);
+  const [avatarActionId, setAvatarActionId] = useState<string | null>(null);
+  const [voiceItems, setVoiceItems] = useState<VoiceCatalogItem[]>([]);
+  const [voiceLoading, setVoiceLoading] = useState(false);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [voiceLabel, setVoiceLabel] = useState("");
+  const voiceProvider = SUPPORTED_LOCAL_COSYVOICE_PROVIDER;
+  const voiceModel = SUPPORTED_LOCAL_COSYVOICE_MODEL;
+  const [voicePromptText, setVoicePromptText] = useState("");
+  const [voiceFile, setVoiceFile] = useState<File | null>(null);
+  const [voiceUploading, setVoiceUploading] = useState(false);
+  const [voicePreviewingId, setVoicePreviewingId] = useState<number | null>(null);
+  const [voiceActionId, setVoiceActionId] = useState<number | null>(null);
   const newKnowledgeFileInputRef = useRef<HTMLInputElement>(null);
   const uploadKnowledgeFileInputRef = useRef<HTMLInputElement>(null);
   const filePoolUploadInputRef = useRef<HTMLInputElement>(null);
+  const avatarUploadInputRef = useRef<HTMLInputElement>(null);
+  const voiceUploadInputRef = useRef<HTMLInputElement>(null);
+  const previewAudioUrlRef = useRef<string | null>(null);
 
   const loadExports = useCallback(async () => {
     setLoading(true);
@@ -374,6 +415,38 @@ export function AssetLibraryWorkspace({
     }
   }, [avatars, onNotify, onSceneBackgroundsChange, onSceneCompositionsChange]);
 
+  const loadAssetAvatars = useCallback(async () => {
+    setAssetAvatarLoading(true);
+    setAssetAvatarError(null);
+    try {
+      const result = await apiGet<AvatarSummary[]>("/avatars");
+      setAssetAvatars(result);
+    } catch (err) {
+      console.warn("load avatars failed", err);
+      const detail = err instanceof ApiError ? err.detail : null;
+      setAssetAvatarError(detail || "数字人资产加载失败");
+    } finally {
+      setAssetAvatarLoading(false);
+    }
+  }, []);
+
+  const loadVoiceAssets = useCallback(async () => {
+    setVoiceLoading(true);
+    setVoiceError(null);
+    try {
+      const result = await apiGet<{ items: VoiceCatalogItem[] }>(
+        `/voices?provider=${encodeURIComponent(SUPPORTED_LOCAL_COSYVOICE_PROVIDER)}`,
+      );
+      setVoiceItems((result.items ?? []).filter(isSupportedLocalCosyVoiceClone));
+    } catch (err) {
+      console.warn("load voices failed", err);
+      const detail = err instanceof ApiError ? err.detail : null;
+      setVoiceError(detail || "声音资产加载失败");
+    } finally {
+      setVoiceLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (activeTabOverride) setActiveTab(activeTabOverride);
   }, [activeTabOverride]);
@@ -401,6 +474,25 @@ export function AssetLibraryWorkspace({
     if (activeTab === "scenes") void loadScenes();
   }, [activeTab, loadScenes, refreshToken]);
 
+  useEffect(() => {
+    setAssetAvatars(avatars ?? []);
+  }, [avatars]);
+
+  useEffect(() => {
+    if (activeTab === "avatars") void loadAssetAvatars();
+  }, [activeTab, loadAssetAvatars, refreshToken]);
+
+  useEffect(() => {
+    if (activeTab === "voices") void loadVoiceAssets();
+  }, [activeTab, loadVoiceAssets, refreshToken]);
+
+  useEffect(() => () => {
+    if (previewAudioUrlRef.current) {
+      URL.revokeObjectURL(previewAudioUrlRef.current);
+      previewAudioUrlRef.current = null;
+    }
+  }, []);
+
   const totalSize = useMemo(
     () => items.reduce((sum, item) => sum + item.size_bytes, 0),
     [items],
@@ -422,6 +514,14 @@ export function AssetLibraryWorkspace({
     || uploadKnowledgeFiles.length === 0
   );
   const filePoolUploadDisabled = filePoolUploading || filePoolFiles.length === 0;
+  const avatarUploadDisabled = avatarUploading || !avatarName.trim() || !avatarFile;
+  const voiceUploadDisabled = (
+    voiceUploading
+    || !voiceLabel.trim()
+    || !voiceFile
+    || !voicePromptText.trim()
+    || !voiceProvider.trim()
+  );
 
   const handleTabChange = useCallback((tab: AssetTab) => {
     setActiveTab(tab);
@@ -444,8 +544,16 @@ export function AssetLibraryWorkspace({
       void loadScenes();
       return;
     }
+    if (activeTab === "avatars") {
+      void loadAssetAvatars();
+      return;
+    }
+    if (activeTab === "voices") {
+      void loadVoiceAssets();
+      return;
+    }
     if (activeTab === "exports") void loadExports();
-  }, [activeTab, loadAllKnowledgeDocuments, loadExports, loadKnowledgeBases, loadKnowledgeDocuments, loadScenes, onRefreshMemoryLibraries, selectedKnowledgeId]);
+  }, [activeTab, loadAllKnowledgeDocuments, loadAssetAvatars, loadExports, loadKnowledgeBases, loadKnowledgeDocuments, loadScenes, loadVoiceAssets, onRefreshMemoryLibraries, selectedKnowledgeId]);
 
   const handleCopyPath = useCallback(async (path: string) => {
     try {
@@ -535,6 +643,117 @@ export function AssetLibraryWorkspace({
       onNotify?.(detail ? `删除失败：${detail}` : "删除失败，请稍后重试。", "error");
     } finally {
       setDeletingId(null);
+    }
+  }, [onNotify]);
+
+  const handleCreateAvatarAsset = useCallback(async () => {
+    if (avatarUploadDisabled || !avatarFile) return;
+    setAvatarUploading(true);
+    try {
+      const form = new FormData();
+      const baseAvatarId = assetAvatars.find((avatar) => !avatar.is_custom)?.id ?? "office-woman";
+      form.set("base_avatar_id", baseAvatarId);
+      form.set("name", avatarName.trim());
+      form.set("model", avatarModel);
+      form.set("image", avatarFile);
+      await apiPostForm<AvatarSummary>("/avatars/custom", form);
+      setAvatarName("");
+      setAvatarFile(null);
+      if (avatarUploadInputRef.current) avatarUploadInputRef.current.value = "";
+      onNotify?.("数字人头像已上传。", "success");
+      void loadAssetAvatars();
+    } catch (err) {
+      console.warn("upload avatar asset failed", err);
+      const detail = err instanceof ApiError ? err.detail : null;
+      onNotify?.(detail ? `上传失败：${detail}` : "上传失败，请稍后重试。", "error");
+    } finally {
+      setAvatarUploading(false);
+    }
+  }, [assetAvatars, avatarFile, avatarModel, avatarName, avatarUploadDisabled, loadAssetAvatars, onNotify]);
+
+  const handleDeleteAvatarAsset = useCallback(async (avatar: AvatarSummary) => {
+    if (!avatar.is_custom) return;
+    const confirmed = window.confirm(`删除自定义数字人「${avatar.name ?? avatar.id}」？已被业务配置引用的资产需要先切换配置。`);
+    if (!confirmed) return;
+    setAvatarActionId(avatar.id);
+    try {
+      await apiDelete(`/avatars/${encodeURIComponent(avatar.id)}`);
+      setAssetAvatars((prev) => prev.filter((item) => item.id !== avatar.id));
+      onNotify?.("自定义数字人已删除。", "success");
+    } catch (err) {
+      console.warn("delete avatar asset failed", err);
+      const detail = err instanceof ApiError ? err.detail : null;
+      onNotify?.(detail ? `删除失败：${detail}` : "删除失败，请稍后重试。", "error");
+    } finally {
+      setAvatarActionId(null);
+    }
+  }, [onNotify]);
+
+  const handleUploadVoiceAsset = useCallback(async () => {
+    if (voiceUploadDisabled || !voiceFile) return;
+    setVoiceUploading(true);
+    try {
+      const form = new FormData();
+      form.set("provider", voiceProvider.trim());
+      form.set("target_model", voiceModel.trim());
+      form.set("display_label", voiceLabel.trim());
+      form.set("prompt_text", voicePromptText.trim());
+      form.set("audio", voiceFile);
+      await apiPostForm("/voices/clone", form);
+      setVoiceLabel("");
+      setVoicePromptText("");
+      setVoiceFile(null);
+      if (voiceUploadInputRef.current) voiceUploadInputRef.current.value = "";
+      onNotify?.("声音资产已上传。", "success");
+      void loadVoiceAssets();
+    } catch (err) {
+      console.warn("upload voice asset failed", err);
+      const detail = err instanceof ApiError ? err.detail : null;
+      onNotify?.(detail ? `上传失败：${detail}` : "上传失败，请稍后重试。", "error");
+    } finally {
+      setVoiceUploading(false);
+    }
+  }, [loadVoiceAssets, onNotify, voiceFile, voiceLabel, voiceModel, voicePromptText, voiceProvider, voiceUploadDisabled]);
+
+  const handlePreviewVoiceAsset = useCallback(async (voice: VoiceCatalogItem) => {
+    setVoicePreviewingId(voice.id);
+    try {
+      const payload: TTSPreviewPayload = {
+        text: LOCAL_COSYVOICE_PREVIEW_TEXT,
+        voice: voice.voice_id,
+        tts_provider: voice.provider,
+      };
+      if (voice.target_model) payload.tts_model = voice.target_model;
+      const blob = await apiPostBlob("/tts/preview", payload);
+      if (previewAudioUrlRef.current) URL.revokeObjectURL(previewAudioUrlRef.current);
+      const url = URL.createObjectURL(blob);
+      previewAudioUrlRef.current = url;
+      const audio = new Audio(url);
+      await audio.play();
+    } catch (err) {
+      console.warn("preview voice asset failed", err);
+      const detail = err instanceof ApiError ? err.detail : null;
+      onNotify?.(detail ? `试听失败：${detail}` : "试听失败，请稍后重试。", "error");
+    } finally {
+      setVoicePreviewingId(null);
+    }
+  }, [onNotify]);
+
+  const handleDeleteVoiceAsset = useCallback(async (voice: VoiceCatalogItem) => {
+    if (voice.source !== "clone") return;
+    const confirmed = window.confirm(`删除复刻声音「${voice.display_label}」？已被业务配置引用的声音需要先切换配置。`);
+    if (!confirmed) return;
+    setVoiceActionId(voice.id);
+    try {
+      await apiDelete(`/voices/${encodeURIComponent(String(voice.id))}`);
+      setVoiceItems((prev) => prev.filter((item) => item.id !== voice.id));
+      onNotify?.("复刻声音已删除。", "success");
+    } catch (err) {
+      console.warn("delete voice asset failed", err);
+      const detail = err instanceof ApiError ? err.detail : null;
+      onNotify?.(detail ? `删除失败：${detail}` : "删除失败，请稍后重试。", "error");
+    } finally {
+      setVoiceActionId(null);
     }
   }, [onNotify]);
 
@@ -1228,6 +1447,226 @@ export function AssetLibraryWorkspace({
     </div>
   );
 
+  const renderAvatarsTab = () => (
+    <div className="space-y-3">
+      <section className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+        <h2 className="text-sm font-semibold text-slate-950">上传数字人头像</h2>
+        <p className="mt-1 text-xs leading-relaxed text-slate-500">
+          修改现有形象时请上传新资产，确认可用后在业务配置里切换到新的 Avatar ID。
+        </p>
+        <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_10rem_minmax(0,1fr)_auto] lg:items-end">
+          <label className="block text-xs font-semibold text-slate-600">
+            名称
+            <input
+              value={avatarName}
+              onChange={(event) => setAvatarName(event.target.value)}
+              className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:border-cyan-300"
+            />
+          </label>
+          <label className="block text-xs font-semibold text-slate-600">
+            驱动模型
+            <select
+              value={avatarModel}
+              onChange={(event) => setAvatarModel(event.target.value)}
+              className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm"
+            >
+              <option value="quicktalk">quicktalk</option>
+              <option value="flashhead">flashhead</option>
+              <option value="wav2lip">wav2lip</option>
+            </select>
+          </label>
+          <label className="block text-xs font-semibold text-slate-600">
+            图片
+            <input
+              ref={avatarUploadInputRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp"
+              onChange={(event) => setAvatarFile(event.currentTarget.files?.[0] ?? null)}
+              className="mt-1 block w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"
+            />
+          </label>
+          <button
+            type="button"
+            disabled={avatarUploadDisabled}
+            onClick={() => void handleCreateAvatarAsset()}
+            className="rounded-lg bg-slate-950 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {avatarUploading ? "上传中..." : "上传"}
+          </button>
+        </div>
+      </section>
+      {assetAvatarError ? (
+        <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm font-medium text-red-700">{assetAvatarError}</div>
+      ) : null}
+      {assetAvatarLoading ? (
+        <div className="flex min-h-[18rem] items-center justify-center rounded-lg border border-dashed border-slate-300 bg-slate-50 text-sm font-medium text-slate-500">
+          数字人资产加载中...
+        </div>
+      ) : assetAvatars.length ? (
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {assetAvatars.map((avatar) => (
+            <article key={avatar.id} className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+              <div className="flex gap-3">
+                <img
+                  src={buildApiUrl(`/avatars/${encodeURIComponent(avatar.id)}/preview`)}
+                  alt={avatar.name ?? avatar.id}
+                  className="h-16 w-16 shrink-0 rounded-md border border-slate-200 object-cover"
+                />
+                <div className="min-w-0 flex-1">
+                  <h2 className="truncate text-sm font-semibold text-slate-950">{avatar.name ?? avatar.id}</h2>
+                  <p className="mt-1 text-xs text-slate-500">{avatar.model_type ?? "unknown"} · {avatar.is_custom ? "自定义" : "内置"}</p>
+                  <p className="mt-1 break-all font-mono text-[11px] text-slate-500">{avatar.id}</p>
+                  {avatar.is_custom ? (
+                    <button
+                      type="button"
+                      disabled={avatarActionId === avatar.id}
+                      onClick={() => void handleDeleteAvatarAsset(avatar)}
+                      className="mt-2 text-xs font-semibold text-rose-600 hover:text-rose-500 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {avatarActionId === avatar.id ? "删除中..." : "删除"}
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            </article>
+          ))}
+        </div>
+      ) : (
+        <div className="flex min-h-[18rem] items-center justify-center rounded-lg border border-dashed border-slate-300 bg-slate-50 text-sm font-medium text-slate-500">
+          暂无数字人资产
+        </div>
+      )}
+    </div>
+  );
+
+  const renderVoicesTab = () => (
+    <div className="space-y-3">
+      <section className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+        <h2 className="text-sm font-semibold text-slate-950">上传声音资产</h2>
+        <p className="mt-1 text-xs leading-relaxed text-slate-500">
+          本地 CosyVoice 会校验参考文本和音频识别结果，参考文本必须填写音频实际朗读内容。
+        </p>
+        <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_10rem_minmax(0,1fr)_minmax(0,1fr)_auto] lg:items-end">
+          <label className="block text-xs font-semibold text-slate-600">
+            名称
+            <input
+              value={voiceLabel}
+              onChange={(event) => setVoiceLabel(event.target.value)}
+              className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:border-cyan-300"
+            />
+          </label>
+          <label className="block text-xs font-semibold text-slate-600">
+            Provider
+            <input
+              value={voiceProvider}
+              readOnly
+              disabled
+              className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-sm text-slate-500"
+            />
+          </label>
+          <label className="block text-xs font-semibold text-slate-600">
+            模型
+            <input
+              value={voiceModel}
+              readOnly
+              disabled
+              className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-sm text-slate-500"
+            />
+          </label>
+          <label className="block text-xs font-semibold text-slate-600">
+            音频
+            <input
+              ref={voiceUploadInputRef}
+              type="file"
+              accept="audio/wav,audio/mpeg,audio/mp4,audio/webm,audio/ogg,audio/flac"
+              onChange={(event) => setVoiceFile(event.currentTarget.files?.[0] ?? null)}
+              className="mt-1 block w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600"
+            />
+          </label>
+          <button
+            type="button"
+            disabled={voiceUploadDisabled}
+            onClick={() => void handleUploadVoiceAsset()}
+            className="rounded-lg bg-slate-950 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {voiceUploading ? "上传中..." : "上传"}
+          </button>
+        </div>
+        <label className="mt-3 block text-xs font-semibold text-slate-600">
+          参考文本
+          <textarea
+            value={voicePromptText}
+            onChange={(event) => setVoicePromptText(event.target.value)}
+            rows={3}
+            className="mt-1 w-full resize-y rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:border-cyan-300"
+          />
+        </label>
+      </section>
+      {voiceError ? (
+        <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm font-medium text-red-700">{voiceError}</div>
+      ) : null}
+      {voiceLoading ? (
+        <div className="flex min-h-[18rem] items-center justify-center rounded-lg border border-dashed border-slate-300 bg-slate-50 text-sm font-medium text-slate-500">
+          声音资产加载中...
+        </div>
+      ) : voiceItems.length ? (
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {voiceItems.map((voice) => (
+            <article key={`${voice.provider}:${voice.voice_id}`} className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <h2 className="truncate text-sm font-semibold text-slate-950">{voice.display_label}</h2>
+                  <p className="mt-1 text-xs text-slate-500">{voice.provider} · {voice.source === "clone" ? "复刻" : "系统"}</p>
+                </div>
+                <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-semibold text-slate-500">
+                  {voice.id}
+                </span>
+              </div>
+              <div className="mt-3 space-y-2 rounded-lg bg-slate-50 p-2 text-xs text-slate-600">
+                <p className="break-all"><span className="font-semibold text-slate-500">Voice ID：</span>{voice.voice_id}</p>
+                <p className="break-all"><span className="font-semibold text-slate-500">模型：</span>{voice.target_model || "默认"}</p>
+              </div>
+              <div className="mt-3 flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  disabled={voicePreviewingId === voice.id}
+                  onClick={() => void handlePreviewVoiceAsset(voice)}
+                  className="text-xs font-semibold text-cyan-700 hover:text-cyan-600 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {voicePreviewingId === voice.id ? "试听中..." : "试听"}
+                </button>
+                {voice.source === "clone" ? (
+                  <button
+                    type="button"
+                    disabled={voiceActionId === voice.id}
+                    onClick={() => void handleDeleteVoiceAsset(voice)}
+                    className="text-xs font-semibold text-rose-600 hover:text-rose-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {voiceActionId === voice.id ? "删除中..." : "删除"}
+                  </button>
+                ) : null}
+              </div>
+            </article>
+          ))}
+        </div>
+      ) : (
+        <div className="flex min-h-[18rem] items-center justify-center rounded-lg border border-dashed border-slate-300 bg-slate-50 text-sm font-medium text-slate-500">
+          暂无声音资产
+        </div>
+      )}
+    </div>
+  );
+
+  const refreshLoading = activeTab === "knowledge"
+    ? knowledgeLoading
+    : activeTab === "scenes"
+      ? sceneLoading
+      : activeTab === "avatars"
+        ? assetAvatarLoading
+        : activeTab === "voices"
+          ? voiceLoading
+          : loading;
+
   return (
     <main className="flex min-h-0 flex-1 flex-col bg-slate-100 p-4">
       <section className="flex min-h-0 flex-1 flex-col rounded-lg border border-slate-200 bg-white shadow-sm">
@@ -1252,6 +1691,16 @@ export function AssetLibraryWorkspace({
                 <span>{sceneBackgrounds.length} 个背景</span>
                 <span>{sceneCompositions.length} 个组合</span>
               </>
+            ) : activeTab === "avatars" ? (
+              <>
+                <span>{assetAvatars.length} 个数字人</span>
+                <span>{assetAvatars.filter((avatar) => avatar.is_custom).length} 个自定义</span>
+              </>
+            ) : activeTab === "voices" ? (
+              <>
+                <span>{voiceItems.length} 个声音</span>
+                <span>{voiceItems.filter((voice) => voice.source === "clone").length} 个复刻</span>
+              </>
             ) : (
               <>
                 <span>{items.length} 个导出</span>
@@ -1261,10 +1710,10 @@ export function AssetLibraryWorkspace({
             <button
               type="button"
               onClick={handleRefresh}
-              disabled={activeTab === "knowledge" ? knowledgeLoading : activeTab === "scenes" ? sceneLoading : loading}
+              disabled={refreshLoading}
               className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 font-semibold text-slate-700 transition hover:border-cyan-200 hover:text-cyan-700 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {(activeTab === "knowledge" ? knowledgeLoading : activeTab === "scenes" ? sceneLoading : loading) ? "刷新中..." : "刷新"}
+              {refreshLoading ? "刷新中..." : "刷新"}
             </button>
           </div>
         </div>
@@ -1360,9 +1809,13 @@ export function AssetLibraryWorkspace({
             renderMemoryTab()
           ) : activeTab === "scenes" ? (
             renderScenesTab()
+          ) : activeTab === "avatars" ? (
+            renderAvatarsTab()
+          ) : activeTab === "voices" ? (
+            renderVoicesTab()
           ) : (
             <div className="flex min-h-[18rem] items-center justify-center rounded-lg border border-dashed border-slate-300 bg-slate-50 text-sm font-medium text-slate-500">
-              声音资产管理规划中
+              暂无资产
             </div>
           )}
         </div>

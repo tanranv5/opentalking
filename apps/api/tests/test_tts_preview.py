@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import io
 import json
 import logging
+import threading
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -247,7 +251,7 @@ def test_tts_preview_form_passes_indextts_emotion_audio_file(monkeypatch):
 
 
 
-def test_tts_preview_local_cosyvoice_returns_after_enough_preview_audio(monkeypatch):
+def test_tts_preview_local_cosyvoice_drains_after_enough_preview_audio(monkeypatch):
     from apps.api.routes import tts_preview
 
     yielded: list[int] = []
@@ -283,7 +287,111 @@ def test_tts_preview_local_cosyvoice_returns_after_enough_preview_audio(monkeypa
 
     assert response.status_code == 200
     assert response.content.startswith(b'RIFF')
-    assert 1 <= len(yielded) < 20
+    assert len(yielded) == 20
+
+
+def test_tts_preview_local_cosyvoice_trims_leading_silence_before_limit(monkeypatch):
+    from apps.api.routes import tts_preview
+
+    class FakeTTS:
+        async def synthesize_stream(self, text: str, voice: str | None = None):
+            yield AudioChunk(
+                data=np.zeros(16000 * 4, dtype=np.int16),
+                sample_rate=16000,
+                duration_ms=4000.0,
+            )
+            yield AudioChunk(
+                data=np.full(16000, 4000, dtype=np.int16),
+                sample_rate=16000,
+                duration_ms=1000.0,
+            )
+
+    def fake_build_tts_adapter(**kwargs):
+        return FakeTTS()
+
+    monkeypatch.setattr(tts_preview, "build_tts_adapter", fake_build_tts_adapter)
+
+    app = FastAPI()
+    app.include_router(tts_preview.router)
+    client = TestClient(app)
+
+    response = client.post(
+        "/tts/preview",
+        json={
+            "text": "你好，我正在测试音色。",
+            "tts_provider": "local_cosyvoice",
+        },
+    )
+
+    assert response.status_code == 200
+    with wave.open(io.BytesIO(response.content), "rb") as wav:
+        pcm = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2")
+    assert pcm.size <= 16000 * 2
+    assert np.max(np.abs(pcm[:1600])) > 1000
+
+
+def test_tts_preview_local_cosyvoice_rejects_concurrent_preview(monkeypatch):
+    from apps.api.routes import tts_preview
+
+    calls = 0
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    class FakeTTS:
+        def __init__(self, call_index: int):
+            self.call_index = call_index
+
+        async def synthesize_stream(self, text: str, voice: str | None = None):
+            if self.call_index == 1:
+                first_started.set()
+                while not release_first.is_set():
+                    await asyncio.sleep(0.01)
+            yield AudioChunk(
+                data=np.ones(16000, dtype=np.int16),
+                sample_rate=16000,
+                duration_ms=1000.0,
+            )
+
+    def fake_build_tts_adapter(**kwargs):
+        nonlocal calls
+        calls += 1
+        return FakeTTS(calls)
+
+    monkeypatch.setattr(tts_preview, "build_tts_adapter", fake_build_tts_adapter)
+
+    app = FastAPI()
+    app.include_router(tts_preview.router)
+    client = TestClient(app)
+
+    first_response: dict[str, object] = {}
+
+    def run_first_request() -> None:
+        first_response["response"] = client.post(
+            "/tts/preview",
+            json={
+                "text": "你好，我正在测试音色。",
+                "tts_provider": "local_cosyvoice",
+            },
+        )
+
+    worker = threading.Thread(target=run_first_request)
+    worker.start()
+    assert first_started.wait(timeout=2)
+    try:
+        response = client.post(
+            "/tts/preview",
+            json={
+                "text": "你好，我正在测试音色。",
+                "tts_provider": "local_cosyvoice",
+            },
+        )
+    finally:
+        release_first.set()
+        worker.join(timeout=2)
+
+    assert response.status_code == 503
+    assert "busy" in response.json()["detail"]
+    assert first_response["response"].status_code == 200
 
 def test_tts_preview_rejects_empty_text():
     from apps.api.routes import tts_preview

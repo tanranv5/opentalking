@@ -55,6 +55,19 @@ _TTS_OPENER_PCM_CACHE: dict[str, np.ndarray] = {}
 _TTS_OPENER_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 _TTS_OPENER_PRELOAD_TASK: asyncio.Task[None] | None = None
 _SENTINEL = object()  # unique marker for "not yet set"
+_COSYVOICE3_END_OF_PROMPT = "<|endofprompt|>"
+
+
+def _is_cosyvoice3_control_mode(tts_provider: str | None, tts_model: str | None) -> bool:
+    settings = get_settings()
+    provider = str(tts_provider or settings.tts_provider or "").strip().lower()
+    model = str(
+        tts_model
+        or settings.tts_model
+        or getattr(settings, "tts_local_cosyvoice_model", "")
+        or ""
+    ).strip().lower()
+    return provider == "local_cosyvoice" and (not model or "cosyvoice3" in model)
 
 
 def _agent_memory_enabled_for_runtime(
@@ -1903,6 +1916,9 @@ class FlashTalkRunner:
                 # can be queued while current sentence is still being synthesised.
                 sentence_q: asyncio.Queue[str | None] = asyncio.Queue(maxsize=4)
                 trim_lead_after_opener = {"applied": False}
+                cosyvoice3_instruction_prefix = ""
+                cosyvoice3_pending_prefix = ""
+                cosyvoice3_detection_done = not _is_cosyvoice3_control_mode(tts_provider, tts_model)
 
                 async def _append_pcm(pcm: np.ndarray, *, subtitle: str | None = None) -> int:
                     nonlocal audio_buffer
@@ -1994,6 +2010,11 @@ class FlashTalkRunner:
                         sentence[:30],
                         tts_text[:30] if tts_text else "",
                     )
+                    synth_text = (
+                        f"{cosyvoice3_instruction_prefix}{tts_text}"
+                        if cosyvoice3_instruction_prefix
+                        else tts_text
+                    )
                     t0 = _t.monotonic()
                     chunks_produced = 0
                     first_pcm_ms: float | None = None
@@ -2001,7 +2022,7 @@ class FlashTalkRunner:
                     held_tail = np.zeros(0, dtype=np.int16)
                     hold_samples = int(sample_rate * max(0.0, boundary_fade_ms) / 1000.0)
                     pending_subtitle: str | None = tts_text
-                    async for tts_chunk in tts.synthesize_stream(tts_text):
+                    async for tts_chunk in tts.synthesize_stream(synth_text):
                         if self._interrupt.is_set():
                             return
                         pcm = np.asarray(tts_chunk.data, dtype=np.int16)
@@ -2135,8 +2156,20 @@ class FlashTalkRunner:
                 async def _llm_feeder():
                     """Stream LLM deltas, split into sentences, push to sentence_q."""
                     nonlocal full_response, text_buffer
+                    nonlocal cosyvoice3_detection_done, cosyvoice3_instruction_prefix, cosyvoice3_pending_prefix
                     t_llm0 = time.perf_counter()
                     t_first_token: float | None = None
+
+                    async def _feed_text_delta(text_delta: str) -> None:
+                        nonlocal full_response
+                        if not text_delta:
+                            return
+                        full_response += text_delta
+                        for sentence in splitter.feed(text_delta):
+                            if self._interrupt.is_set():
+                                break
+                            await _queue_sentence_for_tts(sentence)
+
                     try:
                         log.info("LLM streaming started for: %s", text[:50])
                         async for delta in self.llm.chat_stream(_llm_request_messages()):
@@ -2145,13 +2178,39 @@ class FlashTalkRunner:
                             piece = strip_emoji(delta)
                             if t_first_token is None and piece.strip():
                                 t_first_token = time.perf_counter()
-                            full_response += piece
-                            for sentence in splitter.feed(delta):
-                                if self._interrupt.is_set():
-                                    break
-                                await _queue_sentence_for_tts(sentence)
+                            text_delta = piece
+                            if not cosyvoice3_detection_done:
+                                cosyvoice3_pending_prefix += piece
+                                if _COSYVOICE3_END_OF_PROMPT in cosyvoice3_pending_prefix:
+                                    instruction, _, rest = cosyvoice3_pending_prefix.partition(
+                                        _COSYVOICE3_END_OF_PROMPT
+                                    )
+                                    instruction = instruction.strip()
+                                    if instruction:
+                                        cosyvoice3_instruction_prefix = (
+                                            f"{instruction}{_COSYVOICE3_END_OF_PROMPT}"
+                                        )
+                                        log.info(
+                                            "CosyVoice3 instruction prefix captured: chars=%d preview=%r",
+                                            len(instruction),
+                                            instruction[:60],
+                                        )
+                                    text_delta = rest
+                                    cosyvoice3_pending_prefix = ""
+                                    cosyvoice3_detection_done = True
+                                elif len(cosyvoice3_pending_prefix) < 256:
+                                    continue
+                                else:
+                                    text_delta = cosyvoice3_pending_prefix
+                                    cosyvoice3_pending_prefix = ""
+                                    cosyvoice3_detection_done = True
+                            await _feed_text_delta(text_delta)
 
                         if not self._interrupt.is_set():
+                            if not cosyvoice3_detection_done and cosyvoice3_pending_prefix:
+                                await _feed_text_delta(cosyvoice3_pending_prefix)
+                                cosyvoice3_pending_prefix = ""
+                                cosyvoice3_detection_done = True
                             remainder = splitter.flush()
                             log.info(
                                 "Splitter flush: remainder=%r",

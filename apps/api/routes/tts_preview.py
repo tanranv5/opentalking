@@ -3,7 +3,9 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import tempfile
+import threading
 import wave
 from pathlib import Path
 from typing import Annotated, Any
@@ -24,9 +26,13 @@ router = APIRouter(prefix="/tts", tags=["tts"])
 logger = logging.getLogger(__name__)
 
 MAX_PREVIEW_TEXT_CHARS = 1000
-LOCAL_COSYVOICE_PREVIEW_SECONDS = 3.0
+LOCAL_COSYVOICE_PREVIEW_SECONDS = 8.0
+LOCAL_COSYVOICE_PROVIDER = "local_cosyvoice"
+COSYVOICE3_END_OF_PROMPT = "<|endofprompt|>"
+LOCAL_COSYVOICE3_PREVIEW_INSTRUCTION = "用标准普通话中文自然朗读，不要翻译，不要使用外语。"
 _INDEXTTS_PROVIDERS = {"indextts", "local_indextts", "omnirt_indextts"}
 PreviewUploadFile = UploadFile | StarletteUploadFile
+_LOCAL_COSYVOICE_PREVIEW_LOCK = threading.Lock()
 
 
 class TTSPreviewRequest(BaseModel):
@@ -38,9 +44,17 @@ class TTSPreviewRequest(BaseModel):
 
 
 def _preview_sample_limit(provider: str | None, sample_rate: int) -> int | None:
-    if provider == "local_cosyvoice":
+    if provider == LOCAL_COSYVOICE_PROVIDER:
         return max(1, int(sample_rate * LOCAL_COSYVOICE_PREVIEW_SECONDS))
     return None
+
+
+def _local_cosyvoice_preview_service_url() -> str:
+    return os.environ.get("OPENTALKING_TTS_LOCAL_COSYVOICE_PREVIEW_SERVICE_URL", "").strip()
+
+
+def _prepare_preview_text(text: str, provider: str | None, model: str | None) -> str:
+    return text
 
 
 def _wav_bytes(chunks: list[np.ndarray], sample_rate: int) -> bytes:
@@ -53,6 +67,38 @@ def _wav_bytes(chunks: list[np.ndarray], sample_rate: int) -> bytes:
         wf.setframerate(sample_rate)
         wf.writeframes(pcm.tobytes())
     return out.getvalue()
+
+
+def _trim_preview_edge_silence(
+    pcm: np.ndarray,
+    sample_rate: int,
+    *,
+    threshold: int = 300,
+    frame_ms: float = 20.0,
+    padding_ms: float = 80.0,
+) -> np.ndarray:
+    data = np.asarray(pcm, dtype=np.int16).reshape(-1)
+    if data.size == 0:
+        return data
+    frame = max(1, int(sample_rate * frame_ms / 1000.0))
+    pad = max(0, int(sample_rate * padding_ms / 1000.0))
+
+    start = 0
+    for idx in range(0, data.size, frame):
+        chunk = data[idx : idx + frame]
+        if chunk.size and int(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) >= threshold:
+            start = max(0, idx - pad)
+            break
+    else:
+        return data
+
+    end = data.size
+    for idx in range(data.size, 0, -frame):
+        chunk = data[max(0, idx - frame) : idx]
+        if chunk.size and int(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) >= threshold:
+            end = min(data.size, idx + pad)
+            break
+    return data[start:end]
 
 
 def _normalize_preview_request(
@@ -212,35 +258,69 @@ async def preview_tts(request: Request) -> Response:
     )
     settings = get_settings()
     sample_rate = int(settings.tts_sample_rate)
-    tts = build_tts_adapter(
-        sample_rate=sample_rate,
-        chunk_ms=40.0,
-        default_voice=voice,
-        tts_provider=provider,
-        tts_model=model,
-        indextts_config=indextts_config,
-    )
+    local_cosyvoice_lock_acquired = False
+    if provider == LOCAL_COSYVOICE_PROVIDER:
+        local_cosyvoice_lock_acquired = _LOCAL_COSYVOICE_PREVIEW_LOCK.acquire(blocking=False)
+        if not local_cosyvoice_lock_acquired:
+            raise HTTPException(status_code=503, detail="local_cosyvoice preview busy")
+    tts = None
     chunks: list[np.ndarray] = []
     effective_sample_rate = sample_rate
     sample_limit = _preview_sample_limit(provider, sample_rate)
+    drain_after_limit = provider == LOCAL_COSYVOICE_PROVIDER
+    preview_text = _prepare_preview_text(text, provider, model)
     total_samples = 0
     try:
-        async for chunk in tts.synthesize_stream(text, voice=voice):
+        preview_service_url = _local_cosyvoice_preview_service_url() if provider == LOCAL_COSYVOICE_PROVIDER else ""
+        if preview_service_url:
+            from opentalking.providers.tts.local_cosyvoice.adapter import LocalCosyVoiceTTSAdapter
+
+            tts = LocalCosyVoiceTTSAdapter(
+                default_voice=voice,
+                sample_rate=sample_rate,
+                chunk_ms=40.0,
+                model=model,
+                service_url=preview_service_url,
+            )
+        else:
+            tts = build_tts_adapter(
+                sample_rate=sample_rate,
+                chunk_ms=40.0,
+                default_voice=voice,
+                tts_provider=provider,
+                tts_model=model,
+                indextts_config=indextts_config,
+            )
+        async for chunk in tts.synthesize_stream(preview_text, voice=voice):
             arr = np.asarray(chunk.data, dtype=np.int16).reshape(-1)
             if arr.size:
-                chunks.append(arr.copy())
+                if provider == LOCAL_COSYVOICE_PROVIDER:
+                    chunks.append(arr.copy())
+                elif sample_limit is None or total_samples < sample_limit:
+                    if sample_limit is not None and total_samples + int(arr.size) > sample_limit:
+                        arr = arr[: sample_limit - total_samples]
+                    chunks.append(arr.copy())
                 total_samples += int(arr.size)
             effective_sample_rate = int(chunk.sample_rate or effective_sample_rate)
-            if sample_limit is not None and total_samples >= sample_limit:
+            if sample_limit is not None and total_samples >= sample_limit and not drain_after_limit:
                 break
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"TTS preview failed: {exc}") from exc
     finally:
-        close = getattr(tts, "aclose", None)
+        close = getattr(tts, "aclose", None) if tts is not None else None
         if close is not None:
             await close()
+        if local_cosyvoice_lock_acquired:
+            _LOCAL_COSYVOICE_PREVIEW_LOCK.release()
         if emotion_audio_path is not None:
             emotion_audio_path.unlink(missing_ok=True)
+
+    if provider == LOCAL_COSYVOICE_PROVIDER and chunks:
+        pcm = _trim_preview_edge_silence(np.concatenate(chunks), effective_sample_rate)
+        sample_limit = _preview_sample_limit(provider, effective_sample_rate)
+        if sample_limit is not None and pcm.size > sample_limit:
+            pcm = pcm[:sample_limit]
+        chunks = [pcm] if pcm.size else []
 
     if not chunks:
         raise HTTPException(status_code=502, detail="TTS preview returned no audio")

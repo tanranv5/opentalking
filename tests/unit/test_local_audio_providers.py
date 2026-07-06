@@ -1947,6 +1947,135 @@ async def test_local_cosyvoice_service_payload_includes_local_voice_prompt(tmp_p
     assert seen["prompt_text"] == "这是一段本地音色参考文本。"
 
 
+@pytest.mark.asyncio
+async def test_local_cosyvoice3_clone_uses_zero_shot_without_explicit_instruction(tmp_path, monkeypatch):
+    module = importlib.import_module("opentalking.providers.tts.local_cosyvoice.adapter")
+    monkeypatch.setenv("OPENTALKING_TTS_LOCAL_COSYVOICE_SERVICE_URL", "http://127.0.0.1:19090/synthesize")
+    monkeypatch.setenv("OPENTALKING_LOCAL_AUDIO_MODEL_ROOT", str(tmp_path))
+    voice_dir = tmp_path / "voices" / "clones" / "local-test-voice"
+    voice_dir.mkdir(parents=True)
+    (voice_dir / "prompt.wav").write_bytes(b"RIFFtest")
+    (voice_dir / "prompt.txt").write_text("这是一段本地音色参考文本。", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    class FakeResponse:
+        headers = {
+            "content-type": "audio/L16; rate=16000; channels=1",
+            "x-audio-sample-rate": "16000",
+        }
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_bytes(self):
+            yield np.zeros(160, dtype="<i2").tobytes()
+
+    class FakeStream:
+        async def __aenter__(self):
+            return FakeResponse()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, method, url, json):
+            seen.update(json)
+            return FakeStream()
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeClient)
+
+    adapter = module.LocalCosyVoiceTTSAdapter(
+        sample_rate=16000,
+        chunk_ms=10.0,
+        model="FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
+    )
+    chunks = [chunk async for chunk in adapter.synthesize_stream("你好", voice="local-test-voice")]
+
+    assert chunks
+    assert seen["text"] == "你好"
+    assert seen["prompt_audio"] == str(voice_dir / "prompt.wav")
+    assert seen["prompt_text"] == (
+        "请始终使用标准普通话中文自然清晰地朗读，不要翻译，不要使用英文、外文、颜文字或表情符号。"
+        "<|endofprompt|>这是一段本地音色参考文本。"
+    )
+    assert "mode" not in seen
+    assert "instruction" not in seen
+
+
+@pytest.mark.asyncio
+async def test_local_cosyvoice3_clone_uses_instruct_for_explicit_instruction(tmp_path, monkeypatch):
+    module = importlib.import_module("opentalking.providers.tts.local_cosyvoice.adapter")
+    monkeypatch.setenv("OPENTALKING_TTS_LOCAL_COSYVOICE_SERVICE_URL", "http://127.0.0.1:19090/synthesize")
+    monkeypatch.setenv("OPENTALKING_LOCAL_AUDIO_MODEL_ROOT", str(tmp_path))
+    voice_dir = tmp_path / "voices" / "clones" / "local-test-voice"
+    voice_dir.mkdir(parents=True)
+    (voice_dir / "prompt.wav").write_bytes(b"RIFFtest")
+    (voice_dir / "prompt.txt").write_text("这是一段本地音色参考文本。", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    class FakeResponse:
+        headers = {
+            "content-type": "audio/L16; rate=16000; channels=1",
+            "x-audio-sample-rate": "16000",
+        }
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_bytes(self):
+            yield np.zeros(160, dtype="<i2").tobytes()
+
+    class FakeStream:
+        async def __aenter__(self):
+            return FakeResponse()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def stream(self, method, url, json):
+            seen.update(json)
+            return FakeStream()
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeClient)
+
+    adapter = module.LocalCosyVoiceTTSAdapter(
+        sample_rate=16000,
+        chunk_ms=10.0,
+        model="FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
+    )
+    chunks = [
+        chunk
+        async for chunk in adapter.synthesize_stream(
+            "用冷静的语气说。<|endofprompt|>你好",
+            voice="local-test-voice",
+        )
+    ]
+
+    assert chunks
+    assert seen["text"] == "你好"
+    assert seen["mode"] == "instruct"
+    assert seen["instruction"] == "用冷静的语气说。<|endofprompt|>"
+
+
 def test_local_cosyvoice_service_prewarm_loads_model_and_runs_short_synthesis(monkeypatch):
     from scripts import local_cosyvoice_service as service_module
 

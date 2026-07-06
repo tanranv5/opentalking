@@ -134,6 +134,7 @@ class FlashHeadHTTPClient:
         ref_image: bytes | str | Path,
         prompt: str = "A person is talking. Only the foreground characters are moving, the background remains static.",
         seed: int = 9999,
+        **_ignored: Any,
     ) -> dict[str, Any]:
         await self.connect()
         _ = prompt

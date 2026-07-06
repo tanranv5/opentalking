@@ -35,6 +35,14 @@ _MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 _EDGE_BOUNDARY_CLOSERS = "”’」』）》】〕〉）)]}\"'"
 _EDGE_BOUNDARY_OPENERS = "“‘「『《【〔〈（([{\"'"
 _SPEECH_CONTENT_RE = re.compile(r"[\w\u3400-\u9fff]", flags=re.UNICODE)
+_TTS_ALLOWED_CHARS_RE = re.compile(
+    r"[^0-9A-Za-z\u3400-\u9fff\s"
+    r"，。！？、；：,.!?;:·…“”‘’\"'（）()《》<>【】\[\]—\-~～/]+",
+    flags=re.UNICODE,
+)
+_LEADING_NON_SPEECH_RE = re.compile(r"^[^0-9A-Za-z\u3400-\u9fff]+", flags=re.UNICODE)
+_EMPTY_BRACKETS_RE = re.compile(r"[\(\[（【《<]\s*[\)\]）】》>]")
+_WHITESPACE_RE = re.compile(r"\s+")
 
 
 def strip_emoji(text: str) -> str:
@@ -53,9 +61,17 @@ def strip_markdown(text: str) -> str:
     return text
 
 
+def strip_tts_noise(text: str) -> str:
+    """Remove decorative symbols that speech models tend to pronounce badly."""
+    text = _TTS_ALLOWED_CHARS_RE.sub("", text)
+    text = _EMPTY_BRACKETS_RE.sub("", text)
+    text = _LEADING_NON_SPEECH_RE.sub("", text)
+    return _WHITESPACE_RE.sub(" ", text).strip()
+
+
 def sanitize_tts_text(text: str) -> str:
     """Normalize streamed LLM text into something Edge TTS handles reliably."""
-    text = strip_markdown(strip_emoji(text)).strip()
+    text = strip_tts_noise(strip_markdown(strip_emoji(text))).strip()
     if not text:
         return ""
 
