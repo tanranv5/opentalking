@@ -42,6 +42,8 @@ AnyRunner = Any
 _flashtalk_slot_lock: asyncio.Lock | None = None
 _slot_queue_size: int = 0
 _queued_tasks: dict[str, asyncio.Task] = {}  # sid -> queued background task
+_queued_session_ids: list[str] = []
+_flashtalk_active_session_id: str | None = None
 
 
 def _get_slot_lock() -> asyncio.Lock:
@@ -62,12 +64,28 @@ def slot_is_occupied() -> bool:
     return lock is not None and lock.locked()
 
 
+def _queued_session_ids_snapshot() -> list[str]:
+    return [sid for sid in _queued_session_ids if sid]
+
+
+def _remember_queued_session(sid: str) -> None:
+    if sid and sid not in _queued_session_ids:
+        _queued_session_ids.append(sid)
+
+
+def _forget_queued_session(sid: str) -> None:
+    while sid in _queued_session_ids:
+        _queued_session_ids.remove(sid)
+
+
 async def _sync_slot_status(r: Any) -> None:
     try:
         await set_flashtalk_queue_status(
             r,
             slot_occupied=slot_is_occupied(),
             queue_size=slot_queue_size(),
+            active_session_id=_flashtalk_active_session_id or "",
+            queued_session_ids=_queued_session_ids_snapshot(),
         )
     except Exception:
         log.warning("failed to sync FlashTalk slot status to Redis", exc_info=True)
@@ -373,7 +391,7 @@ async def _init_flashtalk_with_queue(
     Uses a manual cancellation flag instead of asyncio.wait_for to avoid
     forcibly cancelling the lock and corrupting queue state.
     """
-    global _slot_queue_size, _queued_tasks
+    global _slot_queue_size, _queued_tasks, _flashtalk_active_session_id
     settings = get_settings()
     max_queue = settings.flashtalk_max_queue_size
     timeout_sec = settings.flashtalk_slot_timeout_sec or None
@@ -389,6 +407,7 @@ async def _init_flashtalk_with_queue(
         return
 
     _slot_queue_size += 1
+    _remember_queued_session(sid)
     position = _slot_queue_size
     await _sync_slot_status(r)
     cancelled = False  # set to True when session is deleted while waiting
@@ -401,13 +420,15 @@ async def _init_flashtalk_with_queue(
 
     async def _run_with_lock() -> None:
         nonlocal cancelled
-        global _slot_queue_size
+        global _slot_queue_size, _flashtalk_active_session_id
         acquired = False
         try:
             async with lock:
                 acquired = True
                 _slot_queue_size -= 1
                 _queued_tasks.pop(sid, None)
+                _forget_queued_session(sid)
+                _flashtalk_active_session_id = sid
                 await _sync_slot_status(r)
 
                 if cancelled:
@@ -458,6 +479,8 @@ async def _init_flashtalk_with_queue(
                 log.info("FlashTalk slot released by session %s", sid)
         finally:
             if acquired:
+                if _flashtalk_active_session_id == sid:
+                    _flashtalk_active_session_id = None
                 await _sync_slot_status(r)
 
     # Wait for lock with manual timeout check (avoids asyncio.wait_for cancelling the lock)
@@ -472,11 +495,13 @@ async def _init_flashtalk_with_queue(
                 # Check cancellation (session deleted while waiting)
                 if cancelled:
                     _slot_queue_size_dec()
+                    _forget_queued_session(sid)
                     await _sync_slot_status(r)
                     return
                 # Check timeout
                 if deadline and asyncio.get_event_loop().time() > deadline:
                     _slot_queue_size_dec()
+                    _forget_queued_session(sid)
                     await _sync_slot_status(r)
                     log.warning("FlashTalk slot wait timed out (%ss) for session %s", timeout_sec, sid)
                     await set_session_state(r, sid, "error")
@@ -493,6 +518,7 @@ async def _init_flashtalk_with_queue(
             # Session was deleted while waiting in queue
             _slot_queue_size_dec()
             _queued_tasks.pop(sid, None)
+            _forget_queued_session(sid)
             await _sync_slot_status(r)
             log.info("FlashTalk queued session %s cancelled (session deleted)", sid)
 

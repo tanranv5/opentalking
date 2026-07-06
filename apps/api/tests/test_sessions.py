@@ -1046,7 +1046,12 @@ def test_queue_status_reads_shared_redis_state() -> None:
         response = client.get("/queue/status")
 
     assert response.status_code == 200
-    assert response.json() == {"slot_occupied": True, "queue_size": 2}
+    assert response.json() == {
+        "slot_occupied": True,
+        "queue_size": 2,
+        "active_session_id": "",
+        "queued_session_ids": [],
+    }
 
 
 def test_unified_prewarm_model_can_override_avatar_manifest_model() -> None:
