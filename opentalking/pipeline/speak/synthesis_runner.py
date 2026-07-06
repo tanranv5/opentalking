@@ -41,7 +41,7 @@ from opentalking.providers.memory.runtime import MemoryRuntime, MemoryScope
 from opentalking.providers.synthesis.flashtalk.ws_client import FlashTalkWSClient
 from opentalking.providers.synthesis.audio2video_client import Audio2VideoClient, OmniRTAudio2VideoClient
 from opentalking.providers.rtc.aiortc.adapter import WebRTCSession
-from opentalking.providers.tts.factory import create_tts_adapter, tts_log_profile
+from opentalking.providers.tts.factory import build_tts_adapter, create_tts_adapter, tts_log_profile
 from opentalking.runtime.bus import publish_event
 from opentalking.pipeline.speak.audio2video_runner import Audio2VideoRunner
 from opentalking.pipeline.speak.text_sanitize import sanitize_tts_text, strip_emoji
@@ -266,6 +266,10 @@ class FlashTalkRunner:
         self._fasterliveportrait_config_override = normalize_fasterliveportrait_runtime_config(
             fasterliveportrait_config
         )
+        settings = get_settings()
+        self._tts_settings = settings
+        self._render_chunk_ms = float(os.environ.get("OPENTALKING_RENDER_CHUNK_MS", "320.0"))
+        self._wav2lip_live_mode = os.environ.get("OPENTALKING_WAV2LIP_LIVE_MODE", "streaming").strip().lower()
         self.agent_config = AgentSessionConfig(
             user_id=agent_user_id,
             agent_enabled=agent_enabled,
@@ -277,14 +281,14 @@ class FlashTalkRunner:
             knowledge_base_id=knowledge_base_id,
             knowledge_base_ids=knowledge_base_ids,
         )
-        self._memory = MemoryRuntime(scope=memory_scope, settings=get_settings()) if memory_scope else None
+        self._memory = MemoryRuntime(scope=memory_scope, settings=settings) if memory_scope else None
         self.avatars_root = avatars_root
         self.redis = redis
         self._flashtalk_ws_url = flashtalk_ws_url or _default_flashtalk_ws_url()
         self._custom_ref_image_path = custom_ref_image_path.strip()
         # Auth headers for OmniRT (empty when OMNIRT_API_KEY is unset).
         from opentalking.providers.synthesis.omnirt import auth_headers as _omnirt_auth_headers
-        self._extra_ws_headers = _omnirt_auth_headers(get_settings())
+        self._extra_ws_headers = _omnirt_auth_headers(settings)
 
         self.audio2video_runner: Audio2VideoRunner | None = None
         if audio2video_client is None:
@@ -1652,6 +1656,20 @@ class FlashTalkRunner:
             return (target, max_frames, max_wait_ms)
         return (0, 0, 0.0)
 
+    @staticmethod
+    def _quicktalk_env(suffix: str, default: str = "") -> str:
+        raw = os.environ.get(f"OPENTALKING_QUICKTALK_{suffix}", "").strip()
+        if raw:
+            return raw
+        return default
+
+    def _speech_chunk_ms(self) -> float:
+        if self.model_type == "quicktalk":
+            return float(self._quicktalk_env("RENDER_CHUNK_MS", "500.0"))
+        if self.model_type == "wav2lip" and self._wav2lip_live_mode not in {"official", "auto"}:
+            return float(os.environ.get("OPENTALKING_WAV2LIP_RENDER_CHUNK_MS", "200.0"))
+        return self._render_chunk_ms
+
     async def _wait_for_playback_capacity(
         self,
         *,
@@ -1778,7 +1796,7 @@ class FlashTalkRunner:
         if not speech_text or getattr(self, "_closed", False):
             return
 
-        tts = create_tts_adapter(
+        tts = build_tts_adapter(
             sample_rate=16000,
             chunk_ms=self._speech_chunk_ms(),
             settings=self._tts_settings,

@@ -37,9 +37,10 @@ async def test_flashtalk_runner_direct_speak_synthesizes_text_to_uploaded_pcm(
     runner.model_type = "quicktalk"
     runner.speech_tasks = set()
     runner._tts_settings = SimpleNamespace()
-    runner._speech_chunk_ms = lambda: 321.0  # type: ignore[method-assign]
 
-    def fake_create_tts_adapter(**kwargs: object) -> FakeDirectTTS:
+    monkeypatch.delenv("OPENTALKING_QUICKTALK_RENDER_CHUNK_MS", raising=False)
+
+    def fake_build_tts_adapter(**kwargs: object) -> FakeDirectTTS:
         captured["tts_kwargs"] = kwargs
         return FakeDirectTTS(captured)
 
@@ -53,7 +54,7 @@ async def test_flashtalk_runner_direct_speak_synthesizes_text_to_uploaded_pcm(
         captured["enqueue_unix"] = enqueue_unix
         captured["speech_text"] = speech_text
 
-    monkeypatch.setattr(synthesis_runner, "create_tts_adapter", fake_create_tts_adapter)
+    monkeypatch.setattr(synthesis_runner, "build_tts_adapter", fake_build_tts_adapter, raising=False)
     runner.speak_uploaded_pcm = fake_speak_uploaded_pcm  # type: ignore[method-assign]
 
     task = runner.create_direct_speak_task(
@@ -67,7 +68,7 @@ async def test_flashtalk_runner_direct_speak_synthesizes_text_to_uploaded_pcm(
 
     assert captured["tts_kwargs"] == {
         "sample_rate": 16000,
-        "chunk_ms": 321.0,
+        "chunk_ms": 500.0,
         "settings": runner._tts_settings,
         "default_voice": "voice-a",
         "tts_provider": "local_cosyvoice",
