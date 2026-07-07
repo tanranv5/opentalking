@@ -1268,6 +1268,9 @@ async def speak_audio_stream_ws(websocket: WebSocket, session_id: str) -> None:
                         return
         except WebSocketDisconnect:
             pass
+        except RuntimeError as exc:
+            if "disconnect" not in str(exc).lower():
+                raise
         finally:
             sq.put(None)
 

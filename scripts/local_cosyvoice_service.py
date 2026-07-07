@@ -400,7 +400,7 @@ class CosyVoiceService:
         self.min_token_text_ratio = min_token_text_ratio
         self.mask_stop_tokens = mask_stop_tokens
         self._model: Any | None = None
-        self._model_lock = threading.Lock()
+        self._model_lock = threading.RLock()
         self._loaded_model_kwargs: dict[str, Any] = {}
         self._streaming_tuning: dict[str, Any] = {}
         self._flow_tuning: dict[str, Any] = {}
@@ -552,6 +552,35 @@ class CosyVoiceService:
         xi = np.linspace(0.0, pcm.size - 1.0, num=n_dst)
         out = np.interp(xi, np.arange(pcm.size), pcm_f)
         return np.clip(np.round(out * 32768.0), -32768, 32767).astype(np.int16)
+
+    def _model_lock_timeout_seconds(self) -> float:
+        raw = os.environ.get("OPENTALKING_TTS_LOCAL_COSYVOICE_LOCK_TIMEOUT_SECONDS", "2.0").strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 2.0
+        return max(0.0, value)
+
+    def _acquire_model_lock_or_busy(self, *, request_kind: str, text: str) -> None:
+        timeout = self._model_lock_timeout_seconds()
+        started = time.perf_counter()
+        acquired = self._model_lock.acquire(timeout=timeout)
+        waited = time.perf_counter() - started
+        if acquired:
+            if waited >= 0.05:
+                print(
+                    f"cosyvoice model lock acquired request={request_kind} chars={len(text.strip())} waited={waited:.3f}s",
+                    flush=True,
+                )
+            return
+        print(
+            f"cosyvoice busy request={request_kind} chars={len(text.strip())} waited={waited:.3f}s timeout={timeout:.3f}s",
+            flush=True,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="CosyVoice is busy; previous synthesis is still running",
+        )
 
     def _zero_shot_spk_id(self, model: Any, prompt_audio: str, clean_prompt_text: str) -> str:
         """Register (once) a zero-shot speaker so repeat requests skip prompt-audio
@@ -718,13 +747,18 @@ class CosyVoiceService:
         return iterator, source_sr, target_sr, t0, model
 
     def synthesize_pcm_stream(self, req: SynthesizeRequest) -> tuple[Iterator[bytes], int]:
-        iterator, source_sr, target_sr, t0, model = self._streaming_iterator(req)
+        self._acquire_model_lock_or_busy(request_kind="stream", text=req.text)
+        try:
+            iterator, source_sr, target_sr, t0, model = self._streaming_iterator(req)
+        except Exception:
+            self._model_lock.release()
+            raise
 
         def generate() -> Iterator[bytes]:
             first = True
             chunks = 0
             samples = 0
-            with self._model_lock:
+            try:
                 tuned_iterator = _with_request_streaming_tuning(model, iterator)
                 for item in tuned_iterator:
                     speech = item.get("tts_speech") if isinstance(item, dict) else item
@@ -741,6 +775,11 @@ class CosyVoiceService:
                     chunks += 1
                     samples += int(pcm.size)
                     yield pcm.astype("<i2", copy=False).tobytes()
+            finally:
+                close_iterator = getattr(iterator, "close", None)
+                if callable(close_iterator):
+                    close_iterator()
+                self._model_lock.release()
             if chunks == 0:
                 raise RuntimeError("CosyVoice returned no audio")
             print(

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import io
 import queue
+import threading
+import time
 import wave
 import importlib
 import sys
@@ -1669,6 +1671,53 @@ def test_cosyvoice_service_resets_streaming_tuning_per_request(monkeypatch):
     assert engine.token_hop_len == 8
     assert engine.token_max_hop_len == 16
     assert engine.stream_scale_factor == 1
+
+
+def test_cosyvoice_service_rejects_busy_stream_before_queueing(monkeypatch):
+    from scripts import local_cosyvoice_service as service_module
+
+    monkeypatch.setenv("OPENTALKING_TTS_LOCAL_COSYVOICE_LOCK_TIMEOUT_SECONDS", "0.01")
+
+    class FakeEngine:
+        sample_rate = 16000
+
+        def inference_zero_shot(self, text, prompt_text, prompt_audio, stream=True):
+            yield {"tts_speech": np.zeros(160, dtype=np.float32)}
+
+    service = service_module.CosyVoiceService(
+        model_dir="model",
+        runtime_dir="runtime",
+        device="cpu",
+        prompt_audio="prompt.wav",
+        prompt_text="参考文本",
+        mode="zero_shot",
+        instruction="",
+        fp16=False,
+    )
+    monkeypatch.setattr(service, "model", lambda: FakeEngine())
+
+    locked = threading.Event()
+    release = threading.Event()
+
+    def hold_model_lock() -> None:
+        with service._model_lock:
+            locked.set()
+            release.wait(timeout=5.0)
+
+    holder = threading.Thread(target=hold_model_lock)
+    holder.start()
+    assert locked.wait(timeout=1.0)
+
+    started = time.perf_counter()
+    try:
+        with pytest.raises(service_module.HTTPException) as exc:
+            service.synthesize_pcm_stream(service_module.SynthesizeRequest(text="你好"))
+    finally:
+        release.set()
+        holder.join(timeout=1.0)
+
+    assert exc.value.status_code == 503
+    assert time.perf_counter() - started < 0.5
 
 
 @pytest.mark.asyncio

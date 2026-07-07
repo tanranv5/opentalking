@@ -32,9 +32,11 @@ async def test_flashtalk_runner_direct_speak_synthesizes_text_to_uploaded_pcm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
+    published_events: list[tuple[str, str, dict[str, object]]] = []
     runner = FlashTalkRunner.__new__(FlashTalkRunner)
     runner.session_id = "sess_direct"
     runner.model_type = "quicktalk"
+    runner.redis = object()
     runner.speech_tasks = set()
     runner._tts_settings = SimpleNamespace()
 
@@ -55,6 +57,11 @@ async def test_flashtalk_runner_direct_speak_synthesizes_text_to_uploaded_pcm(
         captured["speech_text"] = speech_text
 
     monkeypatch.setattr(synthesis_runner, "build_tts_adapter", fake_build_tts_adapter, raising=False)
+
+    async def fake_publish_event(_redis: object, session_id: str, name: str, data: dict[str, object]) -> None:
+        published_events.append((session_id, name, data))
+
+    monkeypatch.setattr(synthesis_runner, "publish_event", fake_publish_event)
     runner.speak_uploaded_pcm = fake_speak_uploaded_pcm  # type: ignore[method-assign]
 
     task = runner.create_direct_speak_task(
@@ -79,3 +86,6 @@ async def test_flashtalk_runner_direct_speak_synthesizes_text_to_uploaded_pcm(
     assert captured["speech_text"] == "开场白"
     assert captured["enqueue_unix"] == 123.0
     assert captured["closed"] is True
+    assert published_events == [
+        ("sess_direct", "assistant.message", {"session_id": "sess_direct", "text": "开场白"})
+    ]

@@ -1795,6 +1795,7 @@ class FlashTalkRunner:
         speech_text = sanitize_tts_text(strip_emoji(text)).strip()
         if not speech_text or getattr(self, "_closed", False):
             return
+        await self._publish_assistant_message(speech_text)
 
         tts = build_tts_adapter(
             sample_rate=16000,
@@ -1905,6 +1906,23 @@ class FlashTalkRunner:
             payload,
         )
 
+    async def _publish_assistant_message(self, reply_text: str | None) -> bool:
+        text = (reply_text or "").strip()
+        if not text:
+            return False
+        await publish_event(
+            self.redis,
+            self.session_id,
+            "assistant.message",
+            {"session_id": self.session_id, "text": text},
+        )
+        log.info(
+            "assistant.message published: session=%s chars=%d",
+            self.session_id,
+            len(text),
+        )
+        return True
+
     async def speak(
         self,
         text: str,
@@ -1957,6 +1975,7 @@ class FlashTalkRunner:
 
             full_response = ""
             spoken_prefix = ""
+            assistant_message_published = False
             chunk_samples = self.flashtalk.audio_chunk_samples  # 17920
             # Queue: (pcm_chunk, subtitle_for_playback) | None. Subtitle is emitted in the
             # consumer immediately before the matching A/V is queued to WebRTC so UI tracks
@@ -2264,7 +2283,7 @@ class FlashTalkRunner:
 
                 async def _llm_feeder():
                     """Stream LLM deltas, split into sentences, push to sentence_q."""
-                    nonlocal full_response, text_buffer
+                    nonlocal full_response, text_buffer, assistant_message_published
                     nonlocal cosyvoice3_detection_done, cosyvoice3_instruction_prefix, cosyvoice3_pending_prefix
                     t_llm0 = time.perf_counter()
                     t_first_token: float | None = None
@@ -2354,6 +2373,10 @@ class FlashTalkRunner:
                         timing["llm_stream_ms"] = (t_llm1 - t_llm0) * 1000.0
                         if t_first_token is not None:
                             timing["llm_first_token_ms"] = (t_first_token - t_llm0) * 1000.0
+                        if not self._interrupt.is_set() and not assistant_message_published:
+                            assistant_message_published = await self._publish_assistant_message(
+                                _merge_spoken_reply(spoken_prefix, full_response)
+                            )
                         await sentence_q.put(None)  # signal TTS worker to stop
 
                 try:
@@ -2659,6 +2682,8 @@ class FlashTalkRunner:
 
             stored_response = _merge_spoken_reply(spoken_prefix, full_response)
             if stored_response:
+                if not assistant_message_published:
+                    assistant_message_published = await self._publish_assistant_message(stored_response)
                 self.conversation.add_assistant(stored_response)
                 await self._save_agent_turn(user_text=text, assistant_text=stored_response)
                 if self._memory is not None:
