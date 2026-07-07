@@ -225,6 +225,16 @@ def _instantiate_cosyvoice_runtime(cls: Any, model_dir: str, kwargs: dict[str, A
             runtime_kwargs.pop(unsupported)
 
 
+def _resolve_cosyvoice_runtime_class(cosyvoice_module: Any, preferred_name: str) -> Any:
+    cls = getattr(cosyvoice_module, preferred_name, None)
+    if cls is not None:
+        return cls
+    cls = getattr(cosyvoice_module, "AutoModel", None)
+    if cls is not None:
+        return cls
+    raise RuntimeError(f"CosyVoice runtime module exposes neither {preferred_name} nor AutoModel.")
+
+
 def _audio_format_from_content_type(content_type: str | None) -> str | None:
     value = (content_type or "").split(";", 1)[0].strip().lower()
     if value in {"audio/wav", "audio/wave", "audio/x-wav"}:
@@ -465,11 +475,11 @@ class LocalCosyVoiceTTSAdapter:
         }
         model_lower = self.model.lower()
         if "cosyvoice3" in model_lower:
-            cls = getattr(cosyvoice_module, "CosyVoice3", getattr(cosyvoice_module, "AutoModel"))
+            cls = _resolve_cosyvoice_runtime_class(cosyvoice_module, "CosyVoice3")
         elif "cosyvoice2" in model_lower:
-            cls = getattr(cosyvoice_module, "CosyVoice2", getattr(cosyvoice_module, "AutoModel"))
+            cls = _resolve_cosyvoice_runtime_class(cosyvoice_module, "CosyVoice2")
         else:
-            cls = getattr(cosyvoice_module, "CosyVoice", getattr(cosyvoice_module, "AutoModel"))
+            cls = _resolve_cosyvoice_runtime_class(cosyvoice_module, "CosyVoice")
         self._engine = _instantiate_cosyvoice_runtime(cls, model_dir, kwargs)
         return self._engine
 

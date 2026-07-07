@@ -964,6 +964,42 @@ def test_local_cosyvoice3_uses_automodel(monkeypatch):
     assert loaded["model_dir"] == "/models/FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 
 
+def test_local_cosyvoice3_uses_named_runtime_without_automodel(monkeypatch):
+    from opentalking.core import config as core_config
+    from opentalking.providers.tts.local_cosyvoice import adapter as cosy_adapter
+
+    loaded: dict[str, object] = {}
+
+    class FakeCosyVoice3:
+        def __init__(self, model_dir, **kwargs):
+            loaded["model_dir"] = model_dir
+            loaded["kwargs"] = kwargs
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cosyvoice.cli.cosyvoice",
+        SimpleNamespace(CosyVoice3=FakeCosyVoice3),
+    )
+    monkeypatch.delenv("OPENTALKING_TTS_LOCAL_COSYVOICE_MODEL_DIR", raising=False)
+    monkeypatch.setattr(
+        core_config,
+        "get_settings",
+        lambda: SimpleNamespace(
+            tts_tts_local_cosyvoice_model_dir="",
+            tts_local_cosyvoice_model_dir="",
+            local_audio_model_root="",
+        ),
+    )
+    monkeypatch.setattr(cosy_adapter, "_resolve_model_path", lambda model: f"/models/{model}")
+
+    engine = cosy_adapter.LocalCosyVoiceTTSAdapter(
+        model="FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
+    )._load_engine()
+
+    assert isinstance(engine, FakeCosyVoice3)
+    assert loaded["model_dir"] == "/models/FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
+
+
 def test_local_cosyvoice_in_process_reads_runtime_flags(monkeypatch):
     from opentalking.providers.tts.local_cosyvoice import adapter as cosy_adapter
 
@@ -1718,6 +1754,51 @@ def test_cosyvoice_service_rejects_busy_stream_before_queueing(monkeypatch):
 
     assert exc.value.status_code == 503
     assert time.perf_counter() - started < 0.5
+
+
+def test_cosyvoice_model_lock_allows_zero_shot_cache_reentry(tmp_path):
+    from scripts import local_cosyvoice_service as service_module
+
+    prompt_audio = tmp_path / "prompt.wav"
+    prompt_audio.write_bytes(b"fake-wav")
+    calls: list[tuple[str, str, str]] = []
+
+    class FakeEngine:
+        def add_zero_shot_spk(self, prompt_text, prompt_wav, spk_id):
+            calls.append((prompt_text, prompt_wav, spk_id))
+            return True
+
+    service = service_module.CosyVoiceService(
+        model_dir="model",
+        runtime_dir="runtime",
+        device="cpu",
+        prompt_audio=str(prompt_audio),
+        prompt_text="参考文本",
+        mode="zero_shot",
+        instruction="",
+        fp16=False,
+    )
+    done = threading.Event()
+    result: dict[str, str] = {}
+    errors: list[BaseException] = []
+
+    def register_while_locked() -> None:
+        try:
+            with service._model_lock:
+                result["spk_id"] = service._zero_shot_spk_id(FakeEngine(), str(prompt_audio), "参考文本")
+        except BaseException as exc:  # pragma: no cover - surfaced through errors below
+            errors.append(exc)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=register_while_locked, daemon=True)
+    worker.start()
+
+    assert done.wait(timeout=1.0), "zero-shot cache registration must re-enter the model lock"
+    worker.join(timeout=1.0)
+    assert errors == []
+    assert result["spk_id"].startswith("otcache_")
+    assert calls == [("参考文本", str(prompt_audio), result["spk_id"])]
 
 
 @pytest.mark.asyncio

@@ -754,6 +754,8 @@ class CosyVoiceService:
             self._model_lock.release()
             raise
 
+        # StreamingResponse 会在路由返回后继续消费 generator；模型锁必须一直持有到
+        # generator 结束或关闭，避免下一次合成在 CosyVoice 仍产出音频帧时进入。
         def generate() -> Iterator[bytes]:
             first = True
             chunks = 0
