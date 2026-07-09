@@ -43,6 +43,18 @@ _TTS_ALLOWED_CHARS_RE = re.compile(
 _LEADING_NON_SPEECH_RE = re.compile(r"^[^0-9A-Za-z\u3400-\u9fff]+", flags=re.UNICODE)
 _EMPTY_BRACKETS_RE = re.compile(r"[\(\[（【《<]\s*[\)\]）】》>]")
 _WHITESPACE_RE = re.compile(r"\s+")
+_COSYVOICE3_END_OF_PROMPT = "<|endofprompt|>"
+_COSYVOICE3_CONTROL_PREFIX_RE = re.compile(
+    r"^\s*用[^。！？!?<>|]{1,32}语气说[。！？!?]?\s*",
+    flags=re.UNICODE,
+)
+
+
+def strip_cosyvoice3_control_prefix(text: str) -> str:
+    """Remove CosyVoice3 control text when it leaks into speakable text."""
+    if _COSYVOICE3_END_OF_PROMPT in text:
+        return text.rsplit(_COSYVOICE3_END_OF_PROMPT, 1)[-1].strip()
+    return _COSYVOICE3_CONTROL_PREFIX_RE.sub("", text).strip()
 
 
 def strip_emoji(text: str) -> str:
@@ -71,7 +83,9 @@ def strip_tts_noise(text: str) -> str:
 
 def sanitize_tts_text(text: str) -> str:
     """Normalize streamed LLM text into something Edge TTS handles reliably."""
+    text = strip_cosyvoice3_control_prefix(text)
     text = strip_tts_noise(strip_markdown(strip_emoji(text))).strip()
+    text = strip_cosyvoice3_control_prefix(text)
     if not text:
         return ""
 

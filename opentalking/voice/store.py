@@ -89,6 +89,12 @@ def init_voice_store() -> None:
             (107, "dashscope", "Roy", "Roy", None),
             # CosyVoice
             (201, "cosyvoice", "longanyang", "longanyang（示例·男）", None),
+            # 本地 Qwen3-TTS CustomVoice 预设音色（1.7B 支持 instruct 情绪；仅预设音色，复刻走 Base 不带情绪，故不入库）
+            (401, "local_qwen3_tts", "Vivian", "Vivian（中文女）", None),
+            (402, "local_qwen3_tts", "Serena", "Serena（中文女）", None),
+            (403, "local_qwen3_tts", "Uncle_Fu", "Uncle_Fu（中文男·长者）", None),
+            (404, "local_qwen3_tts", "Dylan", "Dylan（中文男）", None),
+            (405, "local_qwen3_tts", "Eric", "Eric（中文男）", None),
             # Xiaomi MiMo, implemented via OpenAI-compatible chat/completions audio.
             (301, "xiaomi_mimo", "mimo_default", "MiMo 默认", "mimo-v2.5-tts"),
             (302, "xiaomi_mimo", "冰糖", "冰糖（中文女声）", "mimo-v2.5-tts"),

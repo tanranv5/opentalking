@@ -289,6 +289,10 @@ def _update_runner_agent_knowledge_bases(runner: object, knowledge_base_ids: lis
 log = logging.getLogger(__name__)
 
 
+def _speech_payload_preview(text: str, limit: int = 120) -> str:
+    return " ".join(str(text or "").split())[:limit]
+
+
 async def _stream_worker_flashtalk_recording(
     *,
     worker_url: str,
@@ -955,6 +959,10 @@ async def speak(session_id: str, body: SpeakRequest, request: Request) -> dict[s
         tts_provider=body.tts_provider,
         tts_model=body.tts_model,
     )
+    log.debug(
+        "OpenTalking speak request: session=%s provider=%s model=%s voice=%s text=%r",
+        session_id, eff_prov, tm, voice, _speech_payload_preview(body.text),
+    )
     await session_service.speak(
         r,
         session_id,
@@ -977,6 +985,10 @@ async def say(session_id: str, body: SpeakRequest, request: Request) -> dict[str
         voice=body.voice,
         tts_provider=body.tts_provider,
         tts_model=body.tts_model,
+    )
+    log.debug(
+        "OpenTalking say request: session=%s provider=%s model=%s voice=%s text=%r",
+        session_id, eff_prov, tm, voice, _speech_payload_preview(body.text),
     )
     await session_service.speak_direct(
         r,

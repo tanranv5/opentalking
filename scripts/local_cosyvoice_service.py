@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import importlib
 import io
+import json
 import os
 import sys
 import threading
@@ -15,7 +17,7 @@ from typing import Any
 
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -827,7 +829,50 @@ def create_app(service: CosyVoiceService) -> FastAPI:
             headers={"X-Audio-Sample-Rate": str(sr)},
         )
 
+    @app.websocket("/synthesize/ws")
+    async def synthesize_ws(ws: WebSocket) -> None:
+        # WS 协议：客户端发一条 JSON payload → 服务端回 {"sample_rate":sr} meta
+        # → 逐帧二进制 PCM → 结束发 {"event":"done"}。与 HTTP /synthesize 复用同一生成逻辑。
+        await ws.accept()
+        try:
+            raw = await ws.receive_text()
+            req = SynthesizeRequest(**json.loads(raw))
+        except (WebSocketDisconnect, json.JSONDecodeError, TypeError, ValueError) as exc:
+            await _ws_send_error(ws, f"invalid request: {exc}")
+            return
+        try:
+            stream, sr = await asyncio.to_thread(service.synthesize_pcm_stream, req)
+        except HTTPException as exc:
+            await _ws_send_error(ws, str(exc.detail))
+            return
+        except Exception as exc:
+            await _ws_send_error(ws, f"cosyvoice synth failed: {type(exc).__name__}: {exc}")
+            return
+        await ws.send_text(json.dumps({"sample_rate": sr}))
+        iterator = iter(stream)
+        try:
+            while True:
+                # 同步 generator 阻塞在推理上，放线程池逐帧拉，避免卡事件循环。
+                frame = await asyncio.to_thread(next, iterator, None)
+                if frame is None:
+                    break
+                await ws.send_bytes(frame)
+            await ws.send_text(json.dumps({"event": "done"}))
+        except WebSocketDisconnect:
+            close_iterator = getattr(stream, "close", None)
+            if callable(close_iterator):
+                close_iterator()
+        except Exception as exc:
+            await _ws_send_error(ws, f"stream failed: {type(exc).__name__}: {exc}")
+
     return app
+
+
+async def _ws_send_error(ws: WebSocket, message: str) -> None:
+    try:
+        await ws.send_text(json.dumps({"error": message}))
+    except Exception:
+        pass
 
 
 def _local_audio_root() -> Path:

@@ -583,7 +583,8 @@ class Settings(BaseSettings):
     #: Shared local model root for local STT/TTS assets.
     local_audio_model_root: str = "./models/local-audio"
     local_audio_device: str = "auto"
-    local_qwen3_tts_model: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    # CustomVoice 1.7B 才支持 instruct 情绪控制；0.6B 会忽略 instruct，故默认用 1.7B-CustomVoice。
+    local_qwen3_tts_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     local_qwen3_tts_service_url: str = ""
 
     torch_device: str = "cpu"

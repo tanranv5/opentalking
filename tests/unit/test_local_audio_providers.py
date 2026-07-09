@@ -924,7 +924,8 @@ def test_local_tts_defaults_use_downloadable_model_ids(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
     assert LocalCosyVoiceTTSAdapter().model == "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
-    assert LocalQwen3TTSAdapter().model == "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    # 默认用 1.7B-CustomVoice：只有它支持 instruct 情绪控制，0.6B 会忽略 instruct。
+    assert LocalQwen3TTSAdapter().model == "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
 
 def test_local_cosyvoice3_uses_automodel(monkeypatch):
@@ -1406,13 +1407,17 @@ def test_qwen3_service_dependencies_are_declared():
     assert "transformers==4.57.3" in pyproject
 
 
-def test_qwen3_service_script_exposes_http_contract():
+def test_qwen3_service_script_exposes_http_ws_contract():
     service = Path("scripts/local_qwen3_tts_service.py").read_text(encoding="utf-8")
 
+    # HTTP 分块 + WS 双传输
     assert "@app.post(\"/synthesize\")" in service
+    assert "@app.websocket(\"/synthesize/ws\")" in service
     assert "OPENTALKING_LOCAL_QWEN3_TTS_MODEL_DIR" in service
-    assert "OPENTALKING_LOCAL_QWEN3_TTS_REF_AUDIO" in service
-    assert "local-qwen3-tts-service" in service
+    # CustomVoice + instruct 情绪（不再是 Base 复刻 REF_AUDIO）
+    assert "generate_custom_voice" in service
+    assert "instruct" in service
+    assert "CustomVoice" in service
 
 
 def test_cosyvoice_service_dependencies_are_declared():
@@ -1810,11 +1815,8 @@ def test_cosyvoice_model_lock_allows_zero_shot_cache_reentry(tmp_path):
             "LocalCosyVoiceTTSAdapter",
             "OPENTALKING_TTS_LOCAL_COSYVOICE_SERVICE_URL",
         ),
-        (
-            "opentalking.providers.tts.local_qwen3_tts.adapter",
-            "LocalQwen3TTSAdapter",
-            "OPENTALKING_LOCAL_QWEN3_TTS_SERVICE_URL",
-        ),
+        # local_qwen3_tts 已改为纯 PCM 流（服务端输出 audio/L16），不再走 wav/mp3 content-type 解码，
+        # 故不在此参数化内；其 PCM 解码由 test_local_qwen3_pcm_stream_* 覆盖。
     ],
 )
 async def test_local_tts_service_wav_response_uses_content_type_decoder(
@@ -2232,3 +2234,109 @@ def test_local_cosyvoice_service_prewarm_loads_model_and_runs_short_synthesis(mo
     service.prewarm(text="你好")
 
     assert calls == ["model", "synth:你好:True"]
+
+
+def test_ws_stream_is_ws_url_detects_scheme():
+    from opentalking.providers.tts._ws_stream import is_ws_url
+
+    assert is_ws_url("ws://127.0.0.1:19090/synthesize/ws") is True
+    assert is_ws_url("wss://host/ws") is True
+    assert is_ws_url("http://127.0.0.1:19090/synthesize") is False
+    assert is_ws_url("https://host/synthesize") is False
+    assert is_ws_url("") is False
+    assert is_ws_url(None) is False
+
+
+def test_qwen3_split_instruction_extracts_emotion():
+    from opentalking.providers.tts.local_qwen3_tts.adapter import _split_instruction
+
+    assert _split_instruction("用愤怒的语气说<|endofprompt|>你到底想干什么") == (
+        "你到底想干什么",
+        "用愤怒的语气说",
+    )
+    # 无分隔符：整段是台词，无 instruct
+    assert _split_instruction("纯台词没有指令") == ("纯台词没有指令", "")
+
+
+def test_qwen3_payload_carries_speaker_and_instruct():
+    from opentalking.providers.tts.local_qwen3_tts.adapter import LocalQwen3TTSAdapter
+
+    adapter = LocalQwen3TTSAdapter(sample_rate=16000, chunk_ms=20.0)
+    payload = adapter._build_payload("用严厉的语气说<|endofprompt|>说清楚", "Serena")
+    assert payload["text"] == "说清楚"
+    assert payload["voice"] == "Serena"
+    assert payload["instruct"] == "用严厉的语气说"
+    assert "1.7B-CustomVoice" in payload["model"]
+    # 无 instruct 时不带该字段
+    plain = adapter._build_payload("直接说这句", "Vivian")
+    assert "instruct" not in plain
+
+
+@pytest.mark.asyncio
+async def test_qwen3_ws_url_uses_ws_transport(monkeypatch):
+    from opentalking.providers.tts import local_qwen3_tts
+    from opentalking.providers.tts.local_qwen3_tts import adapter as qwen_adapter
+
+    monkeypatch.setenv("OPENTALKING_LOCAL_QWEN3_TTS_SERVICE_URL", "ws://127.0.0.1:19091/synthesize/ws")
+    captured: dict[str, object] = {}
+
+    async def fake_ws_pcm_stream(ws_url, payload, sample_rate, chunk_ms):
+        captured["ws_url"] = ws_url
+        captured["payload"] = payload
+        yield AudioChunk(data=np.zeros(160, dtype=np.int16), sample_rate=sample_rate, duration_ms=chunk_ms)
+
+    monkeypatch.setattr(qwen_adapter, "ws_pcm_stream", fake_ws_pcm_stream, raising=True)
+
+    a = qwen_adapter.LocalQwen3TTSAdapter(sample_rate=16000, chunk_ms=10.0)
+    chunks = [c async for c in a.synthesize_stream("用温柔的语气说<|endofprompt|>你好", "Vivian")]
+
+    assert len(chunks) == 1
+    assert captured["ws_url"] == "ws://127.0.0.1:19091/synthesize/ws"
+    assert captured["payload"]["voice"] == "Vivian"
+    assert captured["payload"]["instruct"] == "用温柔的语气说"
+
+
+@pytest.mark.asyncio
+async def test_qwen3_http_url_decodes_pcm_stream(monkeypatch):
+    from opentalking.providers.tts.local_qwen3_tts import adapter as qwen_adapter
+
+    monkeypatch.setenv("OPENTALKING_LOCAL_QWEN3_TTS_SERVICE_URL", "http://127.0.0.1:19091/synthesize")
+    pcm_body = np.arange(320, dtype="<i2").tobytes()
+
+    class FakeResponse:
+        headers = {"content-type": "audio/L16; rate=16000", "x-audio-sample-rate": "16000"}
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_bytes(self):
+            yield pcm_body
+
+    class FakeStream:
+        async def __aenter__(self):
+            return FakeResponse()
+
+        async def __aexit__(self, *a):
+            return False
+
+    class FakeClient:
+        def __init__(self, timeout):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def stream(self, method, url, json):
+            return FakeStream()
+
+    monkeypatch.setattr(qwen_adapter.httpx, "AsyncClient", FakeClient)
+
+    a = qwen_adapter.LocalQwen3TTSAdapter(sample_rate=16000, chunk_ms=10.0)
+    chunks = [c async for c in a.synthesize_stream("说点什么", "Vivian")]
+
+    assert chunks, "should decode PCM into chunks"
+    total = sum(int(c.data.size) for c in chunks)
+    assert total == 320

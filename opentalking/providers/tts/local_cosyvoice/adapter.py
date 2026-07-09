@@ -14,6 +14,7 @@ import httpx
 import numpy as np
 
 from opentalking.core.types.frames import AudioChunk
+from opentalking.providers.tts._ws_stream import is_ws_url, ws_pcm_stream
 
 
 COSYVOICE3_END_OF_PROMPT = "<|endofprompt|>"
@@ -364,8 +365,8 @@ class LocalCosyVoiceTTSAdapter:
         for chunk in chunks:
             yield chunk
 
-    async def _synthesize_via_service(self, text: str, voice: str | None = None) -> AsyncIterator[AudioChunk]:
-        timeout = httpx.Timeout(connect=30.0, read=180.0, write=30.0, pool=30.0)
+    def _build_service_payload(self, text: str, voice: str | None) -> dict[str, Any] | None:
+        """组装发给本地 CosyVoice 服务的请求体；WS/HTTP 两条传输路径共用同一份。"""
         raw_text = text.strip()
         instruction_text = ""
         if "cosyvoice3" in self.model.lower():
@@ -377,8 +378,8 @@ class LocalCosyVoiceTTSAdapter:
         except Exception:
             tts_text = raw_text
         if not tts_text:
-            return
-        payload = {
+            return None
+        payload: dict[str, Any] = {
             "text": tts_text,
             "voice": voice or self.default_voice,
             "model": self.model,
@@ -394,6 +395,18 @@ class LocalCosyVoiceTTSAdapter:
             prompt_text = str(payload.get("prompt_text") or "").strip()
             if prompt_text and COSYVOICE3_END_OF_PROMPT not in prompt_text:
                 payload["prompt_text"] = f"{DEFAULT_COSYVOICE3_INSTRUCTION}{COSYVOICE3_END_OF_PROMPT}{prompt_text}"
+        return payload
+
+    async def _synthesize_via_service(self, text: str, voice: str | None = None) -> AsyncIterator[AudioChunk]:
+        payload = self._build_service_payload(text, voice)
+        if payload is None:
+            return
+        # 传输层按 service_url scheme 自动选择：ws(s):// 走 WebSocket，否则 HTTP 分块流式。
+        if is_ws_url(self.service_url):
+            async for chunk in ws_pcm_stream(self.service_url, payload, self.sample_rate, self.chunk_ms):
+                yield chunk
+            return
+        timeout = httpx.Timeout(connect=30.0, read=180.0, write=30.0, pool=30.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream("POST", self.service_url, json=payload) as resp:
                 resp.raise_for_status()

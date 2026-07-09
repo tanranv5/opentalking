@@ -637,7 +637,8 @@ def tts_provider_config(provider: str) -> dict[str, str | bool | int | float]:
             os.environ.get("OPENTALKING_TTS_LOCAL_QWEN3_TTS_MODEL", "").strip()
             or os.environ.get("OPENTALKING_LOCAL_QWEN3_TTS_MODEL", "").strip()
             or _settings_value("local_qwen3_tts_model", "")
-            or "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+            # CustomVoice 1.7B 才支持 instruct 情绪；0.6B 会忽略 instruct。
+            or "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
         )
         service_url = (
             os.environ.get("OPENTALKING_TTS_LOCAL_QWEN3_TTS_SERVICE_URL", "").strip()
