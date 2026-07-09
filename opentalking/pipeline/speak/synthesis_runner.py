@@ -1712,10 +1712,11 @@ class FlashTalkRunner:
         *,
         tts_provider: str | None = None,
         tts_model: str | None = None,
+        tts_language: str | None = None,
         enqueue_unix: float | None = None,
     ) -> asyncio.Task[None]:
         task = asyncio.create_task(
-            self._run_speak_task(text, tts_voice, tts_provider, tts_model, enqueue_unix)
+            self._run_speak_task(text, tts_voice, tts_provider, tts_model, enqueue_unix, tts_language=tts_language)
         )
         self.speech_tasks.add(task)
         task.add_done_callback(self.speech_tasks.discard)
@@ -1741,6 +1742,7 @@ class FlashTalkRunner:
         *,
         tts_provider: str | None = None,
         tts_model: str | None = None,
+        tts_language: str | None = None,
         enqueue_unix: float | None = None,
     ) -> asyncio.Task[None]:
         task = asyncio.create_task(
@@ -1749,6 +1751,7 @@ class FlashTalkRunner:
                 tts_voice=tts_voice,
                 tts_provider=tts_provider,
                 tts_model=tts_model,
+                tts_language=tts_language,
                 enqueue_unix=enqueue_unix,
             )
         )
@@ -1763,6 +1766,7 @@ class FlashTalkRunner:
         *,
         tts_provider: str | None = None,
         tts_model: str | None = None,
+        tts_language: str | None = None,
         enqueue_unix: float | None = None,
     ) -> None:
         log.info("direct speak start: %s (session=%s)", text[:30], self.session_id)
@@ -1874,6 +1878,7 @@ class FlashTalkRunner:
         tts_provider: str | None = None,
         tts_model: str | None = None,
         enqueue_unix: float | None = None,
+        **kwargs: object,
     ) -> None:
         log.info("speak start: %s (session=%s)", text[:30], self.session_id)
         try:
