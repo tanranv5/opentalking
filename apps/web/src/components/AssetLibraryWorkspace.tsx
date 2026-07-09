@@ -82,12 +82,18 @@ const KNOWLEDGE_FILE_HINT = `支持格式：${KNOWLEDGE_FILE_FORMAT_LABEL}`;
 const KNOWLEDGE_FILE_UNSUPPORTED_MESSAGE = `仅支持 ${KNOWLEDGE_FILE_FORMAT_LABEL} 文件，已忽略不支持的文件。`;
 const SUPPORTED_LOCAL_COSYVOICE_PROVIDER = "local_cosyvoice";
 const SUPPORTED_LOCAL_COSYVOICE_MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512";
+const SUPPORTED_LOCAL_QWEN3_TTS_PROVIDER = "local_qwen3_tts";
+const SUPPORTED_VOICE_PROVIDERS = [SUPPORTED_LOCAL_COSYVOICE_PROVIDER, SUPPORTED_LOCAL_QWEN3_TTS_PROVIDER] as const;
 const LOCAL_COSYVOICE_PREVIEW_TEXT = "你好，我正在用标准普通话中文测试这个声音资产。请清晰自然地朗读这句话。";
 
-function isSupportedLocalCosyVoiceClone(voice: VoiceCatalogItem): boolean {
-  return voice.provider === SUPPORTED_LOCAL_COSYVOICE_PROVIDER
-    && voice.target_model === SUPPORTED_LOCAL_COSYVOICE_MODEL
-    && voice.source === "clone";
+function isSupportedVoiceAsset(voice: VoiceCatalogItem): boolean {
+  if (voice.provider === SUPPORTED_LOCAL_COSYVOICE_PROVIDER) {
+    return voice.target_model === SUPPORTED_LOCAL_COSYVOICE_MODEL && voice.source === "clone";
+  }
+  if (voice.provider === SUPPORTED_LOCAL_QWEN3_TTS_PROVIDER) {
+    return true;
+  }
+  return false;
 }
 
 function formatDuration(seconds: number | null): string {
@@ -313,8 +319,11 @@ export function AssetLibraryWorkspace({
   const [voiceLoading, setVoiceLoading] = useState(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [voiceLabel, setVoiceLabel] = useState("");
-  const voiceProvider = SUPPORTED_LOCAL_COSYVOICE_PROVIDER;
-  const voiceModel = SUPPORTED_LOCAL_COSYVOICE_MODEL;
+  const [voiceProviderFilter, setVoiceProviderFilter] = useState(SUPPORTED_LOCAL_COSYVOICE_PROVIDER);
+  const voiceProvider = voiceProviderFilter;
+  const voiceModel = voiceProviderFilter === SUPPORTED_LOCAL_QWEN3_TTS_PROVIDER
+    ? "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    : SUPPORTED_LOCAL_COSYVOICE_MODEL;
   const [voicePromptText, setVoicePromptText] = useState("");
   const [voiceFile, setVoiceFile] = useState<File | null>(null);
   const [voiceUploading, setVoiceUploading] = useState(false);
@@ -435,9 +444,9 @@ export function AssetLibraryWorkspace({
     setVoiceError(null);
     try {
       const result = await apiGet<{ items: VoiceCatalogItem[] }>(
-        `/voices?provider=${encodeURIComponent(SUPPORTED_LOCAL_COSYVOICE_PROVIDER)}`,
+        `/voices?provider=${encodeURIComponent(voiceProviderFilter)}`,
       );
-      setVoiceItems((result.items ?? []).filter(isSupportedLocalCosyVoiceClone));
+      setVoiceItems((result.items ?? []).filter(isSupportedVoiceAsset));
     } catch (err) {
       console.warn("load voices failed", err);
       const detail = err instanceof ApiError ? err.detail : null;
@@ -445,7 +454,7 @@ export function AssetLibraryWorkspace({
     } finally {
       setVoiceLoading(false);
     }
-  }, []);
+  }, [voiceProviderFilter]);
 
   useEffect(() => {
     if (activeTabOverride) setActiveTab(activeTabOverride);
@@ -1542,7 +1551,23 @@ export function AssetLibraryWorkspace({
   const renderVoicesTab = () => (
     <div className="space-y-3">
       <section className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-        <h2 className="text-sm font-semibold text-slate-950">上传声音资产</h2>
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-slate-950">声音资产</h2>
+          <label className="flex items-center gap-2 text-xs font-semibold text-slate-600">
+            Provider
+            <select
+              value={voiceProviderFilter}
+              onChange={(event) => { setVoiceProviderFilter(event.target.value); }}
+              className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm outline-none focus:border-cyan-300"
+            >
+              {SUPPORTED_VOICE_PROVIDERS.map((p) => (
+                <option key={p} value={p}>{p}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+        {voiceProviderFilter === SUPPORTED_LOCAL_COSYVOICE_PROVIDER ? (
+          <>
         <p className="mt-1 text-xs leading-relaxed text-slate-500">
           本地 CosyVoice 会校验参考文本和音频识别结果，参考文本必须填写音频实际朗读内容。
         </p>
@@ -1601,6 +1626,12 @@ export function AssetLibraryWorkspace({
             className="mt-1 w-full resize-y rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:border-cyan-300"
           />
         </label>
+          </>
+        ) : (
+          <p className="mt-1 text-xs leading-relaxed text-slate-500">
+            Qwen3-TTS 使用预设音色（Vivian / Serena / Uncle_Fu / Dylan / Eric），无需上传参考音频。
+          </p>
+        )}
       </section>
       {voiceError ? (
         <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm font-medium text-red-700">{voiceError}</div>
