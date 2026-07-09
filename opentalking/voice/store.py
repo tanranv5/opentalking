@@ -95,6 +95,10 @@ def init_voice_store() -> None:
             (403, "local_qwen3_tts", "Uncle_Fu", "Uncle_Fu（中文男·长者）", None),
             (404, "local_qwen3_tts", "Dylan", "Dylan（中文男）", None),
             (405, "local_qwen3_tts", "Eric", "Eric（中文男）", None),
+            (406, "local_qwen3_tts", "Ryan", "Ryan（英文男）", None),
+            (407, "local_qwen3_tts", "Aiden", "Aiden（英文男）", None),
+            (408, "local_qwen3_tts", "Ono_Anna", "Ono_Anna（日文女）", None),
+            (409, "local_qwen3_tts", "Sohee", "Sohee（韩文女）", None),
             # Xiaomi MiMo, implemented via OpenAI-compatible chat/completions audio.
             (301, "xiaomi_mimo", "mimo_default", "MiMo 默认", "mimo-v2.5-tts"),
             (302, "xiaomi_mimo", "冰糖", "冰糖（中文女声）", "mimo-v2.5-tts"),

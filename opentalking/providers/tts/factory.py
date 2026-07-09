@@ -955,6 +955,7 @@ def create_tts_adapter(
     default_voice: str | None = None,
     tts_provider: str | None = None,
     tts_model: str | None = None,
+    tts_language: str | None = None,
     indextts_config: Mapping[str, object] | None = None,
 ):
     """返回与 EdgeTTSAdapter 相同接口的 TTS 适配器实例。"""
@@ -1020,6 +1021,7 @@ def create_tts_adapter(
             sample_rate=sample_rate,
             chunk_ms=chunk_ms,
             model=tts_model,
+            language=tts_language,
         )
     if p == "local_indextts":
         from opentalking.providers.tts.local_indextts.adapter import LocalIndexTTSAdapter

@@ -90,6 +90,7 @@ class LocalQwen3TTSAdapter:
         chunk_ms: float = 20.0,
         *,
         model: str | None = None,
+        language: str | None = None,
     ) -> None:
         self.default_voice = default_voice or "Vivian"
         self.sample_rate = sample_rate
@@ -102,7 +103,8 @@ class LocalQwen3TTSAdapter:
             or "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
         ).strip()
         self.language = (
-            os.environ.get("OPENTALKING_LOCAL_QWEN3_TTS_LANGUAGE", "").strip()
+            (language or "").strip()
+            or os.environ.get("OPENTALKING_LOCAL_QWEN3_TTS_LANGUAGE", "").strip()
             or _settings_value("local_qwen3_tts_language", "")
             or "Chinese"
         )

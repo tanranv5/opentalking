@@ -81,6 +81,10 @@ class SpeakRequest(BaseModel):
         default=None,
         description="TTS 模型覆盖：如 qwen3-tts-flash-realtime、cosyvoice-v3-flash、mimo-v2.5-tts、mimo-v2.5-tts-voiceclone、eleven_flash_v2_5",
     )
+    tts_language: str | None = Field(
+        default=None,
+        description="TTS 输出语言覆盖：Chinese（默认）、English。仅 local_qwen3_tts 生效。",
+    )
 
 
 class WebRTCOfferRequest(BaseModel):

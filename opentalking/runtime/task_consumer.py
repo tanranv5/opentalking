@@ -690,6 +690,8 @@ async def handle_worker_task(
         tts_provider = str(tp).strip().lower() if tp else None
         tm = task.get("tts_model")
         tts_model = str(tm).strip() if tm else None
+        tl = task.get("tts_language")
+        tts_language = str(tl).strip() if tl else None
         enqueue_unix = task.get("enqueue_unix")
         if isinstance(enqueue_unix, (int, float)):
             log.info(
@@ -707,6 +709,7 @@ async def handle_worker_task(
                 tts_voice=tts_voice or None,
                 tts_provider=tts_provider or None,
                 tts_model=tts_model or None,
+                tts_language=tts_language or None,
                 enqueue_unix=enqueue_value,
             )
         else:
@@ -715,6 +718,7 @@ async def handle_worker_task(
                 tts_voice=tts_voice or None,
                 tts_provider=tts_provider or None,
                 tts_model=tts_model or None,
+                tts_language=tts_language or None,
                 enqueue_unix=enqueue_value,
             )
     elif cmd == "speak_direct":
@@ -725,6 +729,8 @@ async def handle_worker_task(
         tts_provider = str(tp).strip().lower() if tp else None
         tm = task.get("tts_model")
         tts_model = str(tm).strip() if tm else None
+        tl = task.get("tts_language")
+        tts_language = str(tl).strip() if tl else None
         enqueue_unix = task.get("enqueue_unix")
         enqueue_value = (
             float(enqueue_unix) if isinstance(enqueue_unix, (int, float)) else None
@@ -736,6 +742,7 @@ async def handle_worker_task(
                 tts_voice=tts_voice or None,
                 tts_provider=tts_provider or None,
                 tts_model=tts_model or None,
+                tts_language=tts_language or None,
                 enqueue_unix=enqueue_value,
             )
         else:
