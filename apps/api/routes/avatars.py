@@ -132,8 +132,7 @@ def _slugify_name(value: str) -> str:
 
 def _unique_avatar_id(root: Path, display_name: str) -> str:
     base = _slugify_name(display_name)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
-    candidate = f"custom-{base}-{stamp}"
+    candidate = f"custom-{base}"
     candidate = candidate[:96].rstrip("-_")
     if not (root / candidate).exists():
         return candidate
