@@ -1014,6 +1014,7 @@ async def test_handle_worker_task_routes_direct_speak_without_chat() -> None:
             "tts_voice": "voice-a",
             "tts_provider": "local_cosyvoice",
             "tts_model": "cosyvoice3",
+            "tts_language": None,
             "enqueue_unix": 123.0,
         }
     ]
@@ -1323,3 +1324,57 @@ async def test_handle_worker_task_cleans_queue_when_cancelled_before_wait_loop(
     assert task_consumer._queued_session_ids == []
     assert task_consumer._flashtalk_active_session_ids == []
     assert sid not in runners
+
+
+class ClipRunner(StubRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.clip_calls: list[str] = []
+
+    async def play_clip(self, clip_id: str) -> None:
+        self.clip_calls.append(clip_id)
+
+
+@pytest.mark.asyncio
+async def test_handle_worker_task_play_clip_dispatches_to_runner() -> None:
+    sid = "sess_clip"
+    redis = InMemoryRedis()
+    await redis.hset(session_key(sid), mapping={"session_id": sid, "state": "ready"})
+    runner = ClipRunner()
+    await runner.prepare()
+
+    await handle_worker_task(
+        {"cmd": "play_clip", "session_id": sid, "clip_id": "N03"},
+        redis, Path("."), "cpu", {sid: runner},
+    )
+
+    assert runner.clip_calls == ["N03"]
+
+
+@pytest.mark.asyncio
+async def test_handle_worker_task_play_clip_unsupported_runner_sends_clip_ended() -> None:
+    sid = "sess_clip_unsupported"
+    redis = InMemoryRedis()
+    await redis.hset(session_key(sid), mapping={"session_id": sid, "state": "ready"})
+    runner = StubRunner()
+    await runner.prepare()
+
+    published: list[dict[str, object]] = []
+    original_publish = task_consumer.publish_event
+
+    async def capture_publish(r: object, session_id: str, name: str, data: dict[str, object]) -> None:
+        published.append({"name": name, **data})
+
+    task_consumer.publish_event = capture_publish  # type: ignore[assignment]
+    try:
+        await handle_worker_task(
+            {"cmd": "play_clip", "session_id": sid, "clip_id": "N05"},
+            redis, Path("."), "cpu", {sid: runner},
+        )
+    finally:
+        task_consumer.publish_event = original_publish  # type: ignore[assignment]
+
+    assert len(published) == 1
+    assert published[0]["name"] == "clip.ended"
+    assert published[0]["clip_id"] == "N05"
+    assert published[0]["played"] is False

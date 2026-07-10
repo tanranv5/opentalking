@@ -87,6 +87,10 @@ class SpeakRequest(BaseModel):
     )
 
 
+class PlayClipRequest(BaseModel):
+    clip_id: str = Field(description="动作片段 ID，如 N03")
+
+
 class WebRTCOfferRequest(BaseModel):
     sdp: str
     type: str

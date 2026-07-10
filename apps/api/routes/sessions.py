@@ -26,6 +26,7 @@ from apps.api.schemas.session import (
     CreateSessionRequest,
     CreateSessionResponse,
     FasterLivePortraitConfigRequest,
+    PlayClipRequest,
     SessionKnowledgeBasesRequest,
     SessionKnowledgeBasesResponse,
     SpeakRequest,
@@ -972,6 +973,19 @@ async def speak(session_id: str, body: SpeakRequest, request: Request) -> dict[s
         tts_model=tm,
         tts_language=body.tts_language,
     )
+    return {"session_id": session_id, "status": "queued"}
+
+
+@router.post("/{session_id}/play_clip")
+async def play_clip(session_id: str, body: PlayClipRequest, request: Request) -> dict[str, str]:
+    r: redis.Redis = request.app.state.redis
+    s = await session_service.get_session(r, session_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="session not found")
+    clip_id = (body.clip_id or "").strip()
+    if not clip_id:
+        raise HTTPException(status_code=400, detail="clip_id is required")
+    await session_service.play_clip(r, session_id, clip_id)
     return {"session_id": session_id, "status": "queued"}
 
 

@@ -344,6 +344,7 @@ class FlashTalkRunner:
         self._media_clock_started = False
         self._av_ts_ms = 0.0
         self._speech_media_active = False
+        self._clip_cache: dict[str, list[np.ndarray]] = {}
         #: Background dynamic idle cache (closes main WS briefly); speak() must await this.
         self._dynamic_idle_prepare_task: asyncio.Task[None] | None = None
         self._recording_frame_index = 0
@@ -1184,6 +1185,46 @@ class FlashTalkRunner:
         )
         return frames
 
+    _CLIP_CACHE_MAX = 24
+
+    def _load_clip_video(self, clip_path: str) -> list[np.ndarray]:
+        cached = self._clip_cache.get(clip_path)
+        if cached is not None:
+            return cached
+        import cv2
+        cap = cv2.VideoCapture(clip_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open clip video: {clip_path}")
+        target_w = self.flashtalk.width
+        target_h = self.flashtalk.height
+        frames: list[np.ndarray] = []
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                h, w = frame.shape[:2]
+                if (w, h) != (target_w, target_h):
+                    import math
+                    scale = max(target_h / h, target_w / w)
+                    fw = math.ceil(scale * w)
+                    fh = math.ceil(scale * h)
+                    frame = cv2.resize(frame, (fw, fh), interpolation=cv2.INTER_AREA)
+                    top = (fh - target_h) // 2
+                    left = (fw - target_w) // 2
+                    frame = frame[top:top + target_h, left:left + target_w]
+                frames.append(np.ascontiguousarray(frame))
+        finally:
+            cap.release()
+        if not frames:
+            raise RuntimeError(f"Clip video has no frames: {clip_path}")
+        if len(self._clip_cache) >= self._CLIP_CACHE_MAX:
+            oldest = next(iter(self._clip_cache))
+            del self._clip_cache[oldest]
+        self._clip_cache[clip_path] = frames
+        log.info("Loaded clip video: session=%s path=%s frames=%d", self.session_id, clip_path, len(frames))
+        return frames
+
     def _load_wav2lip_reference_idle_frames(self) -> list[np.ndarray] | None:
         frame_dir = self._wav2lip_reference_frame_dir()
         if frame_dir is None:
@@ -1716,7 +1757,7 @@ class FlashTalkRunner:
         enqueue_unix: float | None = None,
     ) -> asyncio.Task[None]:
         task = asyncio.create_task(
-            self._run_speak_task(text, tts_voice, tts_provider, tts_model, enqueue_unix, tts_language=tts_language)
+            self._run_speak_task(text, tts_voice, tts_provider, tts_model, tts_language=tts_language, enqueue_unix=enqueue_unix)
         )
         self.speech_tasks.add(task)
         task.add_done_callback(self.speech_tasks.discard)
@@ -3252,6 +3293,76 @@ class FlashTalkRunner:
                 mean,
                 delta,
             )
+
+    def _resolve_clip_path(self, clip_id: str) -> Path | None:
+        safe_id = Path(clip_id).name
+        if safe_id != clip_id or "/" in clip_id or "\\" in clip_id or ".." in clip_id:
+            log.warning("play_clip: rejected unsafe clip_id=%s session=%s", clip_id, self.session_id)
+            return None
+        avatar_clips = self.avatars_root / self.avatar_id / "clips" / f"{safe_id}.mp4"
+        if avatar_clips.exists():
+            return avatar_clips
+        global_clips = self.avatars_root / "clips" / f"{safe_id}.mp4"
+        if global_clips.exists():
+            return global_clips
+        return None
+
+    async def play_clip(self, clip_id: str) -> None:
+        clip_path_obj = self._resolve_clip_path(clip_id)
+        if clip_path_obj is None:
+            log.warning("play_clip: clip not found, ignoring. session=%s avatar=%s clip_id=%s", self.session_id, self.avatar_id, clip_id)
+            await publish_event(
+                self.redis, self.session_id, "clip.ended",
+                {"session_id": self.session_id, "clip_id": clip_id, "played": False},
+            )
+            return
+        clip_path = str(clip_path_obj)
+        try:
+            from opentalking.core.types.frames import VideoFrameData
+            frames_raw = self._load_clip_video(clip_path)
+        except Exception:
+            log.exception("play_clip: failed to load video. session=%s clip=%s", self.session_id, clip_path)
+            await publish_event(
+                self.redis, self.session_id, "clip.ended",
+                {"session_id": self.session_id, "clip_id": clip_id, "played": False},
+            )
+            return
+        fps = max(1.0, float(getattr(self.flashtalk, "fps", 25) or 25))
+        sample_rate = max(1, int(getattr(self.flashtalk, "sample_rate", 16000) or 16000))
+        total_samples = max(1, int(round(len(frames_raw) * sample_rate / fps)))
+        pcm = np.zeros(total_samples, dtype=np.int16)
+        async with self._speak_lock:
+            if self._closed:
+                await publish_event(
+                    self.redis, self.session_id, "clip.ended",
+                    {"session_id": self.session_id, "clip_id": clip_id, "played": False},
+                )
+                return
+            self._interrupt.clear()
+            self._speaking = True
+            self._speech_media_active = True
+            await set_session_state(self.redis, self.session_id, "speaking")
+            played = False
+            try:
+                self._ensure_media_clock_started()
+                vframes = [
+                    VideoFrameData(data=f, width=f.shape[1], height=f.shape[0], timestamp_ms=0.0)
+                    for f in frames_raw
+                ]
+                await self._queue_av_chunk(pcm, vframes)
+                played = not self._interrupt.is_set()
+            except Exception:
+                log.exception("play_clip failed: session=%s clip=%s", self.session_id, clip_path)
+            finally:
+                self._speaking = False
+                self._speech_media_active = False
+                if not self._closed:
+                    await set_session_state(self.redis, self.session_id, "ready")
+                await publish_event(
+                    self.redis, self.session_id, "clip.ended",
+                    {"session_id": self.session_id, "clip_id": clip_id, "played": played},
+                )
+                log.info("play_clip done: session=%s clip=%s frames=%d played=%s", self.session_id, clip_path, len(frames_raw), played)
 
     async def interrupt(self) -> None:
         self._interrupt.set()

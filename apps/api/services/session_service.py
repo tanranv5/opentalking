@@ -331,6 +331,15 @@ async def interrupt(r: redis.Redis, sid: str) -> None:
     await _push_task(r, {"cmd": "interrupt", "session_id": sid})
 
 
+async def play_clip(r: redis.Redis, sid: str, clip_id: str) -> None:
+    await _push_task(r, {
+        "cmd": "play_clip",
+        "session_id": sid,
+        "clip_id": clip_id,
+        "enqueue_unix": time.time(),
+    })
+
+
 async def close_session(r: redis.Redis, sid: str) -> None:
     await set_session_state(r, sid, "closing")
     await _push_task(r, {"cmd": "close", "session_id": sid})
