@@ -972,6 +972,7 @@ async def speak(session_id: str, body: SpeakRequest, request: Request) -> dict[s
         tts_model=tm,
         tts_language=body.tts_language,
     )
+    return {"session_id": session_id, "status": "queued"}
 
 
 @router.post("/{session_id}/say")

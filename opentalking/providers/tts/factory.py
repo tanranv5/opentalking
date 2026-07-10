@@ -1223,6 +1223,7 @@ def build_tts_adapter(
     default_voice: str | None = None,
     tts_provider: str | None = None,
     tts_model: str | None = None,
+    tts_language: str | None = None,
     indextts_config: Mapping[str, object] | None = None,
 ):
     """Settings-based entry point with optional per-request TTS overrides."""
@@ -1271,6 +1272,7 @@ def build_tts_adapter(
             default_voice=default_voice or getattr(settings, "tts_voice", None),
             tts_provider=provider,
             tts_model=effective_tts_model,
+            tts_language=tts_language,
             indextts_config=indextts_config,
         )
 

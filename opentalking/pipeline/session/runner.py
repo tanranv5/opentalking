@@ -638,6 +638,7 @@ class SessionRunner:
         *,
         tts_provider: str | None = None,
         tts_model: str | None = None,
+        tts_language: str | None = None,
         enqueue_unix: float | None = None,
     ) -> asyncio.Task[None]:
         task = asyncio.create_task(
@@ -646,6 +647,7 @@ class SessionRunner:
                 tts_voice=tts_voice,
                 tts_provider=tts_provider,
                 tts_model=tts_model,
+                tts_language=tts_language,
                 enqueue_unix=enqueue_unix,
             )
         )
@@ -659,6 +661,7 @@ class SessionRunner:
         tts_voice: str | None = None,
         tts_provider: str | None = None,
         tts_model: str | None = None,
+        tts_language: str | None = None,
         enqueue_unix: float | None = None,
     ) -> None:
         log.info("speak start: %s (session=%s)", text[:30], self.session_id)
@@ -668,6 +671,7 @@ class SessionRunner:
                 tts_voice=tts_voice,
                 tts_provider=tts_provider,
                 tts_model=tts_model,
+                tts_language=tts_language,
                 enqueue_unix=enqueue_unix,
             )
             log.info("speak done: session=%s", self.session_id)
@@ -685,6 +689,7 @@ class SessionRunner:
         *,
         tts_provider: str | None = None,
         tts_model: str | None = None,
+        tts_language: str | None = None,
         enqueue_unix: float | None = None,
     ) -> asyncio.Task[None]:
         task = asyncio.create_task(
@@ -693,6 +698,7 @@ class SessionRunner:
                 tts_voice=tts_voice,
                 tts_provider=tts_provider,
                 tts_model=tts_model,
+                tts_language=tts_language,
                 enqueue_unix=enqueue_unix,
             )
         )
@@ -706,6 +712,7 @@ class SessionRunner:
         tts_voice: str | None = None,
         tts_provider: str | None = None,
         tts_model: str | None = None,
+        tts_language: str | None = None,
         enqueue_unix: float | None = None,
     ) -> None:
         log.info("chat start: %s (session=%s)", prompt[:30], self.session_id)
@@ -715,6 +722,7 @@ class SessionRunner:
                 tts_voice=tts_voice,
                 tts_provider=tts_provider,
                 tts_model=tts_model,
+                tts_language=tts_language,
                 enqueue_unix=enqueue_unix,
             )
             log.info("chat done: session=%s", self.session_id)
@@ -1223,6 +1231,7 @@ class SessionRunner:
         tts_voice: str | None = None,
         tts_provider: str | None = None,
         tts_model: str | None = None,
+        tts_language: str | None = None,
     ) -> bool:
         if self.model_type != "quicktalk":
             return False
@@ -1238,6 +1247,7 @@ class SessionRunner:
             default_voice=tts_voice,
             tts_provider=tts_provider,
             tts_model=tts_model,
+            tts_language=tts_language,
         )
         pcm_parts: list[np.ndarray] = []
         tts_started_at = _time.perf_counter()
@@ -1360,6 +1370,7 @@ class SessionRunner:
         tts_voice: str | None = None,
         tts_provider: str | None = None,
         tts_model: str | None = None,
+        tts_language: str | None = None,
     ) -> bool:
         if self.model_type != "wav2lip":
             return False
@@ -1379,6 +1390,7 @@ class SessionRunner:
             default_voice=tts_voice,
             tts_provider=tts_provider,
             tts_model=tts_model,
+            tts_language=tts_language,
         )
         pcm_parts: list[np.ndarray] = []
         tts_started_at = _time.perf_counter()
@@ -1463,6 +1475,7 @@ class SessionRunner:
         *,
         tts_provider: str | None = None,
         tts_model: str | None = None,
+        tts_language: str | None = None,
         enqueue_unix: float | None = None,
     ) -> None:
         async with self._speak_lock:
@@ -1528,6 +1541,7 @@ class SessionRunner:
                         tts_voice=tts_voice,
                         tts_provider=tts_provider,
                         tts_model=tts_model,
+                        tts_language=tts_language,
                     )
                     if not official_done:
                         official_done = await self._speak_wav2lip_official(
@@ -1536,6 +1550,7 @@ class SessionRunner:
                             tts_voice=tts_voice,
                             tts_provider=tts_provider,
                             tts_model=tts_model,
+                            tts_language=tts_language,
                         )
                 except asyncio.CancelledError:
                     raise
@@ -1561,6 +1576,7 @@ class SessionRunner:
                     default_voice=tts_voice,
                     tts_provider=tts_provider,
                     tts_model=tts_model,
+                    tts_language=tts_language,
                 )
                 render_queue: asyncio.Queue[_SpeechChunkEnvelope | None] = asyncio.Queue(maxsize=4)
                 audio_queue: asyncio.Queue[_SpeechChunkEnvelope | None] = asyncio.Queue(maxsize=4)
@@ -1743,6 +1759,7 @@ class SessionRunner:
         *,
         tts_provider: str | None = None,
         tts_model: str | None = None,
+        tts_language: str | None = None,
         enqueue_unix: float | None = None,
     ) -> None:
         prompt_text = strip_emoji(prompt or "").strip()
@@ -1819,6 +1836,7 @@ class SessionRunner:
                     default_voice=tts_voice,
                     tts_provider=tts_provider,
                     tts_model=tts_model,
+                    tts_language=tts_language,
                 )
                 render_queue: asyncio.Queue[_SpeechChunkEnvelope | None] = asyncio.Queue(maxsize=4)
                 audio_queue: asyncio.Queue[_SpeechChunkEnvelope | None] = asyncio.Queue(maxsize=4)

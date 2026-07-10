@@ -1776,6 +1776,7 @@ class FlashTalkRunner:
                 tts_voice=tts_voice,
                 tts_provider=tts_provider,
                 tts_model=tts_model,
+                tts_language=tts_language,
                 enqueue_unix=enqueue_unix,
             )
             log.info("direct speak done: session=%s", self.session_id)
@@ -1793,6 +1794,7 @@ class FlashTalkRunner:
         *,
         tts_provider: str | None = None,
         tts_model: str | None = None,
+        tts_language: str | None = None,
         enqueue_unix: float | None = None,
     ) -> None:
         """直接播报 assistant 文本：TTS -> PCM -> 现有音频驱动对口型链路。"""
@@ -1808,6 +1810,7 @@ class FlashTalkRunner:
             default_voice=tts_voice,
             tts_provider=tts_provider,
             tts_model=tts_model,
+            tts_language=tts_language,
         )
         parts: list[np.ndarray] = []
         try:
@@ -1877,6 +1880,7 @@ class FlashTalkRunner:
         tts_voice: str | None = None,
         tts_provider: str | None = None,
         tts_model: str | None = None,
+        tts_language: str | None = None,
         enqueue_unix: float | None = None,
         **kwargs: object,
     ) -> None:
@@ -1887,6 +1891,7 @@ class FlashTalkRunner:
                 tts_voice=tts_voice,
                 tts_provider=tts_provider,
                 tts_model=tts_model,
+                tts_language=tts_language,
                 enqueue_unix=enqueue_unix,
             )
             log.info("speak done: session=%s", self.session_id)
@@ -1935,6 +1940,7 @@ class FlashTalkRunner:
         *,
         tts_provider: str | None = None,
         tts_model: str | None = None,
+        tts_language: str | None = None,
         enqueue_unix: float | None = None,
     ) -> None:
         """Full pipeline: user text → LLM → TTS → FlashTalk → WebRTC.
@@ -2036,6 +2042,7 @@ class FlashTalkRunner:
                     default_voice=tts_voice,
                     tts_provider=tts_provider,
                     tts_model=tts_model,
+                    tts_language=tts_language,
                 )
                 log.info(
                     "TTS pipeline start | %s",

@@ -763,6 +763,7 @@ def test_session_runner_create_speak_task_accepts_tts_overrides() -> None:
         tts_voice: str | None = None,
         tts_provider: str | None = None,
         tts_model: str | None = None,
+        tts_language: str | None = None,
         enqueue_unix: float | None = None,
     ) -> None:
         captured.update(
@@ -771,6 +772,7 @@ def test_session_runner_create_speak_task_accepts_tts_overrides() -> None:
                 "tts_voice": tts_voice,
                 "tts_provider": tts_provider,
                 "tts_model": tts_model,
+                "tts_language": tts_language,
                 "enqueue_unix": enqueue_unix,
             }
         )
@@ -781,8 +783,9 @@ def test_session_runner_create_speak_task_accepts_tts_overrides() -> None:
         task = runner.create_speak_task(
             "hello",
             tts_voice="Cherry",
-            tts_provider="dashscope",
-            tts_model="qwen3-tts-flash-realtime",
+            tts_provider="local_qwen3_tts",
+            tts_model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            tts_language="English",
             enqueue_unix=123.0,
         )
         await task
@@ -792,8 +795,9 @@ def test_session_runner_create_speak_task_accepts_tts_overrides() -> None:
     assert captured == {
         "text": "hello",
         "tts_voice": "Cherry",
-        "tts_provider": "dashscope",
-        "tts_model": "qwen3-tts-flash-realtime",
+        "tts_provider": "local_qwen3_tts",
+        "tts_model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        "tts_language": "English",
         "enqueue_unix": 123.0,
     }
 
@@ -899,8 +903,9 @@ async def test_handle_worker_task_routes_text_speak_through_chat_when_available(
             "session_id": sid,
             "text": "你好",
             "tts_voice": "Cherry",
-            "tts_provider": "dashscope",
-            "tts_model": "qwen3-tts-flash-realtime",
+            "tts_provider": "local_qwen3_tts",
+            "tts_model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            "tts_language": "English",
             "enqueue_unix": 123.0,
         },
         redis,
@@ -915,8 +920,9 @@ async def test_handle_worker_task_routes_text_speak_through_chat_when_available(
         {
             "prompt": "你好",
             "tts_voice": "Cherry",
-            "tts_provider": "dashscope",
-            "tts_model": "qwen3-tts-flash-realtime",
+            "tts_provider": "local_qwen3_tts",
+            "tts_model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            "tts_language": "English",
             "enqueue_unix": 123.0,
         }
     ]
