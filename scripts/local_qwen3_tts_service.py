@@ -1,12 +1,7 @@
-"""Local Qwen3-TTS HTTP/WS service (CustomVoice + instruct 情绪).
+"""Local Qwen3-TTS HTTP/WS service (CustomVoice + instruct) — faster-qwen3-tts edition.
 
-设计约定（与 local_cosyvoice_service 对齐）：
-- 只用 CustomVoice 模型（预设音色 + 自然语言 instruct 情绪控制）。
-  Qwen 官方把"声音复刻"与"指令控制"拆到互斥模型（Base vs CustomVoice / vc vs instruct），
-  同一次合成无法克隆+情绪共存，故本服务不做复刻，只做预设音色+情绪。
-- 输出统一为 little-endian int16 PCM 流（audio/L16），HTTP 分块 + WS 二进制帧两条路，
-  客户端按 PCM 解码，无需再判 wav/mp3。
-- 真流式（stream_generate_pcm）待 GPU 上 qwen_tts 版本确认后再接；当前先整段生成再切 PCM 帧。
+Uses faster_qwen3_tts.FasterQwen3TTS with CUDA graph acceleration and
+true streaming generation via generate_custom_voice_streaming().
 """
 
 from __future__ import annotations
@@ -19,7 +14,7 @@ import os
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
 
 import numpy as np
 import torch
@@ -33,7 +28,6 @@ DEFAULT_MODEL_DIRNAME = "Qwen__Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
 class SynthesizeRequest(BaseModel):
     text: str
-    # voice 即 CustomVoice 预设 speaker 名（Vivian/Serena/...）。
     voice: str | None = None
     instruct: str | None = None
     language: str | None = None
@@ -61,6 +55,7 @@ class Qwen3TTSService:
         language: str,
         max_new_tokens: int,
         chunk_ms: float,
+        streaming_chunk_size: int,
     ) -> None:
         self.model_dir = model_dir
         self.device = device
@@ -69,6 +64,7 @@ class Qwen3TTSService:
         self.language = language
         self.max_new_tokens = max_new_tokens
         self.chunk_ms = chunk_ms
+        self.streaming_chunk_size = streaming_chunk_size
         self._model: Any | None = None
 
     def _torch_dtype(self) -> torch.dtype:
@@ -82,67 +78,101 @@ class Qwen3TTSService:
         if self._model is not None:
             return self._model
         try:
-            from qwen_tts import Qwen3TTSModel
+            from faster_qwen3_tts import FasterQwen3TTS
         except ImportError as exc:
             raise RuntimeError(
-                "qwen_tts is not installed. Install the local-qwen3-tts-service extra in a separate venv."
+                "faster_qwen3_tts is not installed."
             ) from exc
-        kwargs: dict[str, Any] = {
-            "device_map": self.device,
-            "dtype": self._torch_dtype(),
-            "attn_implementation": "sdpa",
-        }
         t0 = time.perf_counter()
-        self._model = Qwen3TTSModel.from_pretrained(self.model_dir, **kwargs)
+        self._model = FasterQwen3TTS.from_pretrained(
+            self.model_dir,
+            device=self.device,
+            dtype=self._torch_dtype(),
+            attn_implementation="sdpa",
+        )
+        elapsed = time.perf_counter() - t0
         print(
-            f"loaded qwen3_tts model={self.model_dir} device={self.device} seconds={time.perf_counter() - t0:.3f}",
+            f"loaded faster_qwen3_tts model={self.model_dir} device={self.device} seconds={elapsed:.3f}",
+            flush=True,
+        )
+        # Warmup: first inference captures CUDA graphs (~10-20s)
+        print("warming up CUDA graphs (first inference)...", flush=True)
+        t1 = time.perf_counter()
+        self._model.generate_custom_voice(
+            text="warmup",
+            language="Chinese",
+            speaker=self.default_speaker,
+        )
+        print(
+            f"warmup done seconds={time.perf_counter() - t1:.3f}",
             flush=True,
         )
         return self._model
 
-    def _generate_pcm(self, req: SynthesizeRequest) -> tuple[np.ndarray, int]:
+    def synthesize_pcm_stream(self, req: SynthesizeRequest) -> tuple[Generator[bytes, None, None], int]:
+        """True streaming: yield PCM i16 frames as they are generated."""
         text = req.text.strip()
         if not text:
             raise HTTPException(status_code=400, detail="text is required")
         speaker = (req.voice or self.default_speaker).strip()
         if not speaker:
             raise HTTPException(status_code=400, detail="voice (CustomVoice speaker) is required")
-        instruct = (req.instruct or "").strip()
-        kwargs: dict[str, Any] = {
-            "text": text,
-            "language": req.language or self.language,
-            "speaker": speaker,
-            "max_new_tokens": self.max_new_tokens,
-        }
-        # instruct 为空时不传，走自然语速；非空则由 CustomVoice 1.7B 做情绪/风格控制。
-        if instruct:
-            kwargs["instruct"] = instruct
-        wavs, sr = self.model().generate_custom_voice(**kwargs)
-        pcm = _audio_to_i16(wavs[0])
-        return pcm, int(sr)
+        instruct = (req.instruct or "").strip() or None
 
-    def synthesize_pcm_stream(self, req: SynthesizeRequest) -> tuple[Iterator[bytes], int]:
-        """整段生成 → 切成 chunk_ms 的 PCM 帧迭代器。真流式后续接入 stream_generate_pcm。"""
         t0 = time.perf_counter()
-        pcm, sr = self._generate_pcm(req)
-        samples_per_chunk = max(1, int(sr * (self.chunk_ms / 1000.0)))
-        print(
-            f"synth chars={len(req.text.strip())} sr={sr} samples={pcm.size} seconds={time.perf_counter() - t0:.3f}",
-            flush=True,
-        )
+        chunk_count = 0
+        total_samples = 0
+        detected_sr = [0]
 
-        def generate() -> Iterator[bytes]:
-            for i in range(0, pcm.size, samples_per_chunk):
-                part = pcm[i : i + samples_per_chunk]
-                if part.size == 0:
+        def generate() -> Generator[bytes, None, None]:
+            nonlocal chunk_count, total_samples
+            kwargs: dict[str, Any] = {
+                "text": text,
+                "language": req.language or self.language,
+                "speaker": speaker,
+                "max_new_tokens": self.max_new_tokens,
+                "chunk_size": self.streaming_chunk_size,
+            }
+            if instruct:
+                kwargs["instruct"] = instruct
+
+            first_chunk_logged = False
+            for audio_chunk, sr, timing in self.model().generate_custom_voice_streaming(**kwargs):
+                detected_sr[0] = int(sr)
+                pcm = _audio_to_i16(audio_chunk)
+                if pcm.size == 0:
                     continue
-                yield part.astype("<i2", copy=False).tobytes()
+                total_samples += pcm.size
+                chunk_count += 1
+                if not first_chunk_logged:
+                    first_chunk_logged = True
+                    first_byte_ms = (time.perf_counter() - t0) * 1000
+                    print(
+                        f"streaming first_byte_ms={first_byte_ms:.0f} prefill_ms={timing.get('prefill_ms', 0):.0f}",
+                        flush=True,
+                    )
+                # Sub-chunk into chunk_ms sized PCM frames for WS/HTTP compatibility
+                samples_per_frame = max(1, int(sr * (self.chunk_ms / 1000.0)))
+                for i in range(0, pcm.size, samples_per_frame):
+                    part = pcm[i : i + samples_per_frame]
+                    if part.size > 0:
+                        yield part.astype("<i2", copy=False).tobytes()
 
-        return generate(), sr
+            elapsed = time.perf_counter() - t0
+            print(
+                f"synth chars={len(text)} sr={detected_sr[0]} samples={total_samples} "
+                f"chunks={chunk_count} seconds={elapsed:.3f}",
+                flush=True,
+            )
+
+        # We need to know SR before we start streaming. The model's sample rate is
+        # deterministic (24000 for Qwen3-TTS 12Hz), so we read it from the loaded model.
+        sr = getattr(self.model(), "sample_rate", 24000)
+        return generate(), int(sr)
 
 
 def create_app(service: Qwen3TTSService) -> FastAPI:
-    app = FastAPI(title="OpenTalking Local Qwen3-TTS Service")
+    app = FastAPI(title="OpenTalking Local Qwen3-TTS Service (faster-qwen3-tts)")
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -151,6 +181,7 @@ def create_app(service: Qwen3TTSService) -> FastAPI:
             "model_dir": service.model_dir,
             "device": service.device,
             "loaded": service._model is not None,
+            "backend": "faster_qwen3_tts",
         }
 
     @app.post("/synthesize")
@@ -172,7 +203,6 @@ def create_app(service: Qwen3TTSService) -> FastAPI:
 
     @app.websocket("/synthesize/ws")
     async def synthesize_ws(ws: WebSocket) -> None:
-        # WS 协议同 local_cosyvoice：payload → {"sample_rate":sr} → PCM 帧 → {"event":"done"}。
         await ws.accept()
         try:
             raw = await ws.receive_text()
@@ -189,10 +219,9 @@ def create_app(service: Qwen3TTSService) -> FastAPI:
             await _ws_send_error(ws, f"qwen3_tts synth failed: {type(exc).__name__}: {exc}")
             return
         await ws.send_text(json.dumps({"sample_rate": sr}))
-        iterator = iter(stream)
         try:
             while True:
-                frame = await asyncio.to_thread(next, iterator, None)
+                frame = await asyncio.to_thread(next, stream, None)
                 if frame is None:
                     break
                 await ws.send_bytes(frame)
@@ -227,6 +256,7 @@ def build_service_from_env() -> Qwen3TTSService:
         language=os.environ.get("OPENTALKING_LOCAL_QWEN3_TTS_LANGUAGE", "Chinese"),
         max_new_tokens=int(os.environ.get("OPENTALKING_LOCAL_QWEN3_TTS_MAX_NEW_TOKENS", "2048")),
         chunk_ms=float(os.environ.get("OPENTALKING_LOCAL_QWEN3_TTS_CHUNK_MS", "20")),
+        streaming_chunk_size=int(os.environ.get("OPENTALKING_LOCAL_QWEN3_TTS_STREAMING_CHUNK_SIZE", "8")),
     )
 
 
@@ -235,10 +265,14 @@ app = create_app(service)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the local Qwen3-TTS HTTP/WS service.")
+    parser = argparse.ArgumentParser(description="Run the local Qwen3-TTS HTTP/WS service (faster-qwen3-tts).")
     parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "19091")))
     args = parser.parse_args()
+    # 启动即加载模型并捕获 CUDA graph，避免首次会话开场白承担 15s+ 冷启动首包。
+    # 端口在预热完成后才打开，start_stack 的 /health 等待因此天然覆盖预热窗口。
+    if os.environ.get("OPENTALKING_LOCAL_QWEN3_TTS_EAGER_LOAD", "1") != "0":
+        service.model()
     import uvicorn
 
     uvicorn.run(app, host=args.host, port=args.port)

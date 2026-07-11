@@ -56,6 +56,29 @@ _TTS_OPENER_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 _TTS_OPENER_PRELOAD_TASK: asyncio.Task[None] | None = None
 _SENTINEL = object()  # unique marker for "not yet set"
 _COSYVOICE3_END_OF_PROMPT = "<|endofprompt|>"
+# Brain(cosplay) 的展示/播报分流信封：display_text 进消息事件，tts_text 进合成。
+_COSPLAY_ENVELOPE_MARKER = '{"_cosplay_display_tts"'
+
+
+def _parse_cosplay_envelope(raw: str) -> tuple[str, str]:
+    """解析 Brain 的 display/tts envelope，返回 (display_text, tts_text)。
+
+    解析失败或结构不符时两者都回退为原文，保证旧版 Brain 纯文本响应不受影响。
+    """
+    text = (raw or "").strip()
+    try:
+        data = json.loads(text)
+    except Exception:
+        return text, text
+    if not isinstance(data, dict) or data.get("_cosplay_display_tts") is not True:
+        return text, text
+    display = str(data.get("display_text") or "").strip()
+    tts = str(data.get("tts_text") or "").strip()
+    if not tts:
+        tts = display
+    if not display:
+        display = tts
+    return display, tts
 
 
 def _is_cosyvoice3_control_mode(tts_provider: str | None, tts_model: str | None) -> bool:
@@ -2340,6 +2363,9 @@ class FlashTalkRunner:
                     nonlocal cosyvoice3_detection_done, cosyvoice3_instruction_prefix, cosyvoice3_pending_prefix
                     t_llm0 = time.perf_counter()
                     t_first_token: float | None = None
+                    envelope_mode = False
+                    envelope_done = False
+                    envelope_buffer = ""
 
                     async def _feed_text_delta(text_delta: str) -> None:
                         nonlocal full_response
@@ -2360,6 +2386,23 @@ class FlashTalkRunner:
                             if t_first_token is None and piece.strip():
                                 t_first_token = time.perf_counter()
                             text_delta = piece
+                            # envelope 检测先于 CosyVoice 前缀检测：整包缓冲到流结束再解析，
+                            # 避免 JSON 被分句器切碎送进 TTS。
+                            if envelope_mode:
+                                envelope_buffer += piece
+                                continue
+                            if not envelope_done:
+                                envelope_buffer += piece
+                                probe = envelope_buffer.lstrip()
+                                if probe.startswith(_COSPLAY_ENVELOPE_MARKER):
+                                    envelope_mode = True
+                                    envelope_done = True
+                                    continue
+                                if _COSPLAY_ENVELOPE_MARKER.startswith(probe) and len(probe) < 64:
+                                    continue
+                                envelope_done = True
+                                text_delta = envelope_buffer
+                                envelope_buffer = ""
                             if not cosyvoice3_detection_done:
                                 cosyvoice3_pending_prefix += piece
                                 if _COSYVOICE3_END_OF_PROMPT in cosyvoice3_pending_prefix:
@@ -2388,6 +2431,34 @@ class FlashTalkRunner:
                             await _feed_text_delta(text_delta)
 
                         if not self._interrupt.is_set():
+                            if envelope_mode:
+                                display_text, envelope_tts = _parse_cosplay_envelope(envelope_buffer)
+                                envelope_buffer = ""
+                                log.info(
+                                    "Cosplay envelope parsed: display_chars=%d tts_chars=%d",
+                                    len(display_text),
+                                    len(envelope_tts),
+                                )
+                                if _COSYVOICE3_END_OF_PROMPT in envelope_tts:
+                                    instruction, _, envelope_tts = envelope_tts.partition(
+                                        _COSYVOICE3_END_OF_PROMPT
+                                    )
+                                    instruction = instruction.strip()
+                                    if instruction:
+                                        cosyvoice3_instruction_prefix = (
+                                            f"{instruction}{_COSYVOICE3_END_OF_PROMPT}"
+                                        )
+                                cosyvoice3_detection_done = True
+                                for sentence in splitter.feed(envelope_tts):
+                                    if self._interrupt.is_set():
+                                        break
+                                    await _queue_sentence_for_tts(sentence)
+                                # 展示/持久化/assistant.message 一律用 display_text（中文）。
+                                full_response = display_text
+                            elif not envelope_done and envelope_buffer:
+                                # 响应太短未完成判定：按普通文本回放。
+                                await _feed_text_delta(envelope_buffer)
+                                envelope_buffer = ""
                             if not cosyvoice3_detection_done and cosyvoice3_pending_prefix:
                                 await _feed_text_delta(cosyvoice3_pending_prefix)
                                 cosyvoice3_pending_prefix = ""
