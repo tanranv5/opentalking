@@ -1868,11 +1868,11 @@ class SessionRunner:
                     tts_text = f"{cosyvoice3_instruction_prefix}{text}" if cosyvoice3_instruction_prefix else text
                     sentence_enqueued = 0
 
-                    async def _enqueue_from_tts(tts_adapter: Any) -> int:
+                    async def _enqueue_from_tts(tts_adapter: Any, synth_text: str) -> int:
                         nonlocal chunk_idx
                         nonlocal sentence_enqueued
                         enqueued = 0
-                        async for tts_chunk in tts_adapter.synthesize_stream(tts_text):
+                        async for tts_chunk in tts_adapter.synthesize_stream(synth_text):
                             if self._interrupt.is_set():
                                 break
                             if chunk_idx == 0:
@@ -1896,7 +1896,7 @@ class SessionRunner:
                         return enqueued
 
                     try:
-                        return await _enqueue_from_tts(tts)
+                        return await _enqueue_from_tts(tts, tts_text)
                     except asyncio.CancelledError:
                         raise
                     except Exception:
@@ -1925,7 +1925,7 @@ class SessionRunner:
                             tts_model=None,
                         )
                         timing.add_count("tts_edge_fallbacks", 1)
-                        return await _enqueue_from_tts(fallback_tts)
+                        return await _enqueue_from_tts(fallback_tts, text)
 
                 # Brain 会把 CosyVoice3 语气指令放在 <|endofprompt|> 前。
                 # 这里先拦截控制前缀，避免字幕/TTS 把“用某种语气说”当正文播出。

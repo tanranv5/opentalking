@@ -509,15 +509,23 @@ class LocalCosyVoiceTTSAdapter:
         return requested or "中文女"
 
     def _synthesize_in_process(self, text: str, voice: str) -> list[AudioChunk]:
+        speech_text, instruct_text = _split_cosyvoice3_instruction(text)
+        try:
+            from opentalking.pipeline.speak.text_sanitize import sanitize_tts_text
+
+            sanitized_speech = sanitize_tts_text(speech_text)
+        except Exception:
+            sanitized_speech = speech_text
+        if not sanitized_speech:
+            return []
         engine = self._load_engine()
         sr = int(getattr(engine, "sample_rate", 22050) or 22050)
         pcm_parts: list[np.ndarray] = []
         local_prompt = _resolve_local_voice_prompt(voice)
         infer_instruct2 = getattr(engine, "inference_instruct2", None)
         if callable(infer_instruct2) and local_prompt is not None:
-            tts_text, instruct_text = _split_cosyvoice3_instruction(text)
             iterator = infer_instruct2(
-                tts_text,
+                sanitized_speech,
                 instruct_text,
                 local_prompt["prompt_audio"],
                 stream=False,
@@ -528,7 +536,7 @@ class LocalCosyVoiceTTSAdapter:
             infer_sft = getattr(engine, "inference_sft", None)
             if not callable(infer_sft):
                 raise RuntimeError("CosyVoice runtime does not expose an available synthesis method.")
-            iterator = infer_sft(text, spk_id, stream=False)
+            iterator = infer_sft(sanitized_speech, spk_id, stream=False)
         for item in iterator:
             speech = item.get("tts_speech") if isinstance(item, dict) else item
             if hasattr(speech, "detach"):

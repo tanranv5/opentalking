@@ -2207,6 +2207,39 @@ async def test_local_cosyvoice3_clone_uses_instruct_for_explicit_instruction(tmp
     assert seen["instruction"] == "用冷静的语气说。<|endofprompt|>"
 
 
+@pytest.mark.asyncio
+async def test_local_cosyvoice_in_process_sft_strips_explicit_instruction(monkeypatch):
+    module = importlib.import_module("opentalking.providers.tts.local_cosyvoice.adapter")
+    monkeypatch.delenv("OPENTALKING_TTS_LOCAL_COSYVOICE_SERVICE_URL", raising=False)
+    monkeypatch.delenv("OPENTALKING_TTS_LOCAL_COSYVOICE_SERVICE_URLS", raising=False)
+    monkeypatch.setattr(module, "_settings_value", lambda _name, default="": default)
+    received: list[str] = []
+
+    class FakeEngine:
+        sample_rate = 16000
+
+        def inference_sft(self, text, spk_id, stream=False):
+            received.append(text)
+            yield {"tts_speech": np.zeros(160, dtype=np.float32)}
+
+    adapter = module.LocalCosyVoiceTTSAdapter(
+        sample_rate=16000,
+        chunk_ms=10.0,
+        model="FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
+    )
+    monkeypatch.setattr(adapter, "_load_engine", lambda: FakeEngine())
+
+    chunks = [
+        chunk
+        async for chunk in adapter.synthesize_stream(
+            "用温柔的语气说。<|endofprompt|>你好。",
+        )
+    ]
+
+    assert chunks
+    assert received == ["你好。"]
+
+
 def test_local_cosyvoice_service_prewarm_loads_model_and_runs_short_synthesis(monkeypatch):
     from scripts import local_cosyvoice_service as service_module
 
