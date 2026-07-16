@@ -49,6 +49,7 @@ from opentalking.pipeline.speak.text_sanitize import sanitize_tts_text, strip_em
 log = logging.getLogger(__name__)
 
 _IDLE_CACHE_VERSION = 6
+_IDLE_VIDEO_MAX_SECONDS = 12.0
 _IDLE_FRAME_CACHE: dict[str, list[np.ndarray]] = {}
 _IDLE_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 _TTS_OPENER_PCM_CACHE: dict[str, np.ndarray] = {}
@@ -993,6 +994,8 @@ class FlashTalkRunner:
             self._dynamic_idle_prepare_task = asyncio.create_task(
                 self._prepare_dynamic_idle_cache(ref_image_path)
             )
+        elif self.model_type in {"quicktalk", "flashhead"}:
+            asyncio.create_task(self._prepare_prerecorded_idle_video(avatar_dir))
         elif self._allow_background_idle_cache:
             asyncio.create_task(self._prepare_idle_cache_background(ref_image_path))
 
@@ -1021,6 +1024,32 @@ class FlashTalkRunner:
             await task
         except Exception:
             pass
+
+    async def _prepare_prerecorded_idle_video(self, avatar_dir: Path) -> None:
+        try:
+            idle_frames = self._load_idle_video(avatar_dir)
+        except Exception as exc:
+            log.info(
+                "Pre-recorded idle video load failed (non-fatal): avatar=%s model=%s error=%s",
+                self.avatar_id,
+                self.model_type,
+                exc,
+            )
+            return
+        if not idle_frames:
+            log.info(
+                "No pre-recorded idle video available: avatar=%s model=%s",
+                self.avatar_id,
+                self.model_type,
+            )
+            return
+        self._set_idle_frames(idle_frames)
+        log.info(
+            "Loaded pre-recorded idle video: avatar=%s model=%s frames=%d",
+            self.avatar_id,
+            self.model_type,
+            len(idle_frames),
+        )
 
     async def _prepare_dynamic_idle_cache(self, ref_image_path: Path) -> None:
         """Build idle clip via IdleVideoGenerator (background, non-blocking)."""
@@ -1175,29 +1204,46 @@ class FlashTalkRunner:
 
         target_w = self.flashtalk.width
         target_h = self.flashtalk.height
+        fps = max(1.0, float(self.flashtalk.fps or 25.0))
+        max_frames = max(1, int(round(fps * _IDLE_VIDEO_MAX_SECONDS)))
         frames: list[np.ndarray] = []
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            h, w = frame.shape[:2]
-            if (w, h) != (target_w, target_h):
-                import math
-                scale = max(target_h / h, target_w / w)
-                fw = math.ceil(scale * w)
-                fh = math.ceil(scale * h)
-                frame = cv2.resize(
-                    frame, (fw, fh),
-                    interpolation=cv2.INTER_AREA,
-                )
-                top = (fh - target_h) // 2
-                left = (fw - target_w) // 2
-                frame = frame[
-                    top:top + target_h,
-                    left:left + target_w,
-                ]
-            frames.append(np.ascontiguousarray(frame))
-        cap.release()
+        truncated = False
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if len(frames) >= max_frames:
+                    truncated = True
+                    break
+                h, w = frame.shape[:2]
+                if (w, h) != (target_w, target_h):
+                    import math
+                    scale = max(target_h / h, target_w / w)
+                    fw = math.ceil(scale * w)
+                    fh = math.ceil(scale * h)
+                    frame = cv2.resize(
+                        frame, (fw, fh),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    top = (fh - target_h) // 2
+                    left = (fw - target_w) // 2
+                    frame = frame[
+                        top:top + target_h,
+                        left:left + target_w,
+                    ]
+                frames.append(np.ascontiguousarray(frame))
+        finally:
+            cap.release()
+
+        if truncated:
+            log.warning(
+                "Idle video truncated at memory limit: %s frames=%d max_seconds=%.1f fps=%.2f",
+                p,
+                len(frames),
+                _IDLE_VIDEO_MAX_SECONDS,
+                fps,
+            )
 
         if not frames:
             log.warning("Idle video has no frames: %s", p)
