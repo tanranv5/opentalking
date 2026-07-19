@@ -1264,6 +1264,8 @@ async def speak_audio_stream_ws(websocket: WebSocket, session_id: str) -> None:
     sq: sync_queue.Queue[bytes | None] = sync_queue.Queue()
     transcript_events: sync_queue.Queue[dict[str, Any] | None] = sync_queue.Queue()
     pcm_rx_stats: dict[str, int] = {"bytes": 0}
+    # 仅客户端显式 {"type":"end"} 后才允许 STT 结果触发 speak；取消/断连不说话。
+    end_requested = False
     t_stream0 = time.perf_counter()
     send_lock = asyncio.Lock()
 
@@ -1277,6 +1279,7 @@ async def speak_audio_stream_ws(websocket: WebSocket, session_id: str) -> None:
             await websocket.close(code=code)
 
     async def pump() -> None:
+        nonlocal end_requested
         try:
             while True:
                 msg = await websocket.receive()
@@ -1292,6 +1295,7 @@ async def speak_audio_stream_ws(websocket: WebSocket, session_id: str) -> None:
                     except json.JSONDecodeError:
                         continue
                     if body.get("type") == "end":
+                        end_requested = True
                         sq.put(None)
                         return
         except WebSocketDisconnect:
@@ -1300,6 +1304,7 @@ async def speak_audio_stream_ws(websocket: WebSocket, session_id: str) -> None:
             if "disconnect" not in str(exc).lower():
                 raise
         finally:
+            # 始终结束 STT 队列；是否 speak 由 end_requested 决定
             sq.put(None)
 
     pump_task = asyncio.create_task(pump())
@@ -1359,6 +1364,18 @@ async def speak_audio_stream_ws(websocket: WebSocket, session_id: str) -> None:
         pump_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await pump_task
+
+    if not end_requested:
+        log.info(
+            "speak_audio_stream cancelled without end: session=%s pcm_rx_bytes=%d text_chars=%d",
+            session_id,
+            pcm_rx_stats["bytes"],
+            len((text or "").strip()),
+        )
+        with contextlib.suppress(Exception):
+            await send_json_safe({"type": "transcript.cancelled", "text": (text or "").strip()})
+        await close_safe(code=1000)
+        return
 
     total_ms = (time.perf_counter() - t_stream0) * 1000.0
     log.info(

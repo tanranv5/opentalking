@@ -488,6 +488,12 @@ class SessionRunner(ExternalClipTaskMixin):
             pcm = self._load_clip_audio(clip_path, sample_count, sample_rate)
             if pcm is None:
                 pcm = np.zeros(sample_count, dtype=np.int16)
+            # 入队 pre-action 前清掉 idle 积压，避免动作/语音超前画面。
+            if self.webrtc is not None:
+                self.webrtc.clear_media_queues()
+                self.webrtc.reset_clocks()
+            self._quicktalk_video_ts_ms = 0.0
+            self._speech_frame_idx = 0
             for index, frame in enumerate(frames[:frame_count]):
                 if self._interrupt.is_set():
                     break

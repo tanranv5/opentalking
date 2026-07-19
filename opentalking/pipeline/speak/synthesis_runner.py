@@ -2701,6 +2701,8 @@ class FlashTalkRunner(ExternalClipTaskMixin):
                     pacing_started = True
                     self._speech_media_active = True
                     if self.webrtc:
+                        # pre-action 已入队时不能清队列，否则会把动作帧冲掉；
+                        # 无 pre-action 时清掉 LLM 等待期 idle 积压。
                         if not pre_action_played:
                             self.webrtc.draining = True
                             self.webrtc.clear_media_queues()
@@ -3544,6 +3546,13 @@ class FlashTalkRunner(ExternalClipTaskMixin):
                 VideoFrameData(data=frame, width=frame.shape[1], height=frame.shape[0], timestamp_ms=0.0)
                 for frame in frames_raw[:frame_count]
             ]
+            # 入队 pre-action 前清掉 LLM 等待期 idle 积压，否则拍桌/语音会超前画面 1~3s。
+            self.webrtc.draining = True
+            self.webrtc.clear_media_queues()
+            self.webrtc.reset_clocks()
+            self.webrtc.draining = False
+            self._av_ts_ms = 0.0
+            self._media_clock_started = False
             self._speech_media_active = True
             self._ensure_media_clock_started()
             await self._queue_av_chunk(pcm, frames, speech_media=False)
