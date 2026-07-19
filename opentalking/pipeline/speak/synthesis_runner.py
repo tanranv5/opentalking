@@ -49,6 +49,7 @@ from opentalking.pipeline.speak.cosplay_envelope import (
     parse_cosplay_envelope,
     pre_action_slice_lengths,
 )
+from opentalking.pipeline.speak.clip_tasks import ExternalClipTaskMixin
 from opentalking.pipeline.speak.text_sanitize import sanitize_tts_text, strip_emoji
 
 log = logging.getLogger(__name__)
@@ -234,7 +235,7 @@ async def _preload_tts_openers(sample_rate: int, default_voice: str | None = Non
             log.warning("Failed to preload TTS opener %r", opener_text, exc_info=True)
 
 
-class FlashTalkRunner:
+class FlashTalkRunner(ExternalClipTaskMixin):
     """Session runner that uses a FlashTalk backend for video generation."""
 
     def __init__(
@@ -333,6 +334,7 @@ class FlashTalkRunner:
         self._prepared = self.ready_event
         self._webrtc_started = asyncio.Event()
         self.speech_tasks: set[asyncio.Task[None]] = set()
+        self._active_clip_task: asyncio.Task[None] | None = None
         self._speaking = False
         self._speech_started = False
         self._closed = False
@@ -1906,6 +1908,7 @@ class FlashTalkRunner:
         tts_language: str | None = None,
         enqueue_unix: float | None = None,
     ) -> None:
+        await self.cancel_active_clip("speech_started")
         log.info("direct speak start: %s (session=%s)", text[:30], self.session_id)
         try:
             await self.speak_direct_text(
@@ -1975,6 +1978,7 @@ class FlashTalkRunner:
         pcm_path: str,
         enqueue_unix: float | None = None,
     ) -> None:
+        await self.cancel_active_clip("speech_started")
         path = Path(pcm_path)
         pcm: np.ndarray | None = None
         try:
@@ -2021,6 +2025,7 @@ class FlashTalkRunner:
         enqueue_unix: float | None = None,
         **kwargs: object,
     ) -> None:
+        await self.cancel_active_clip("speech_started")
         log.info("speak start: %s (session=%s)", text[:30], self.session_id)
         try:
             await self.speak(
@@ -3542,26 +3547,15 @@ class FlashTalkRunner:
         finally:
             self._speech_media_active = False
 
-    async def play_clip(self, clip_id: str) -> None:
+    async def play_clip(self, clip_id: str) -> bool:
         clip_path_obj = self._resolve_clip_path(clip_id)
         if clip_path_obj is None:
-            log.warning("play_clip: clip not found, ignoring. session=%s avatar=%s clip_id=%s", self.session_id, self.avatar_id, clip_id)
-            await publish_event(
-                self.redis, self.session_id, "clip.ended",
-                {"session_id": self.session_id, "clip_id": clip_id, "played": False},
+            raise FileNotFoundError(
+                f"clip not found: session={self.session_id} avatar={self.avatar_id} clip_id={clip_id}"
             )
-            return
         clip_path = str(clip_path_obj)
-        try:
-            from opentalking.core.types.frames import VideoFrameData
-            frames_raw = self._load_clip_video(clip_path)
-        except Exception:
-            log.exception("play_clip: failed to load video. session=%s clip=%s", self.session_id, clip_path)
-            await publish_event(
-                self.redis, self.session_id, "clip.ended",
-                {"session_id": self.session_id, "clip_id": clip_id, "played": False},
-            )
-            return
+        from opentalking.core.types.frames import VideoFrameData
+        frames_raw = self._load_clip_video(clip_path)
         fps = max(1.0, float(getattr(self.flashtalk, "fps", 25) or 25))
         sample_rate = max(1, int(getattr(self.flashtalk, "sample_rate", 16000) or 16000))
         total_samples = max(1, int(round(len(frames_raw) * sample_rate / fps)))
@@ -3571,38 +3565,30 @@ class FlashTalkRunner:
             pcm = np.zeros(total_samples, dtype=np.int16)
         async with self._speak_lock:
             if self._closed:
-                await publish_event(
-                    self.redis, self.session_id, "clip.ended",
-                    {"session_id": self.session_id, "clip_id": clip_id, "played": False},
-                )
-                return
+                raise RuntimeError(f"runner closed: session={self.session_id}")
             self._interrupt.clear()
             self._speaking = True
             self._speech_media_active = True
             await set_session_state(self.redis, self.session_id, "speaking")
-            played = False
             try:
                 self._ensure_media_clock_started()
                 vframes = [
                     VideoFrameData(data=f, width=f.shape[1], height=f.shape[0], timestamp_ms=0.0)
                     for f in frames_raw
                 ]
-                await self._queue_av_chunk(pcm, vframes)
-                played = not self._interrupt.is_set()
-            except Exception:
-                log.exception("play_clip failed: session=%s clip=%s", self.session_id, clip_path)
+                await self._queue_av_chunk(pcm, vframes, speech_media=False)
             finally:
                 self._speaking = False
                 self._speech_media_active = False
                 if not self._closed:
                     await set_session_state(self.redis, self.session_id, "ready")
-                await publish_event(
-                    self.redis, self.session_id, "clip.ended",
-                    {"session_id": self.session_id, "clip_id": clip_id, "played": played},
-                )
-                log.info("play_clip done: session=%s clip=%s frames=%d played=%s", self.session_id, clip_path, len(frames_raw), played)
+        await asyncio.sleep(len(frames_raw) / fps)
+        played = not self._interrupt.is_set()
+        log.info("play_clip done: session=%s clip=%s frames=%d played=%s", self.session_id, clip_path, len(frames_raw), played)
+        return played
 
     async def interrupt(self) -> None:
+        await self.cancel_active_clip("interrupted")
         self._interrupt.set()
         pending_speech_tasks = [task for task in self.speech_tasks if not task.done()]
         # 仅在「确有口播在进行」时需要整段重建 FlashTalk 会话；空闲时跳过可省 ~1s（close/reconnect/init）。

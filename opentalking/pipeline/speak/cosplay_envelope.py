@@ -31,16 +31,15 @@ def parse_cosplay_envelope(raw: str) -> tuple[str, str, str | None, str | None, 
     action = str(data.get("action") or "").strip() or None
     assistant_turn_id = str(data.get("assistant_turn_id") or "").strip() or None
     timing_raw = str(data.get("action_timing") or "").strip().lower()
-    if timing_raw in {"pre", "before"}:
+    action_timing: str | None = None
+    if action:
+        if not timing_raw:
+            raise ValueError("action_timing is required when action is present")
+        if timing_raw in {"post", "after"}:
+            raise ValueError("post action must not be sent to OpenTalking")
+        if timing_raw not in {"pre", "before"}:
+            raise ValueError(f"invalid action_timing: {timing_raw}")
         action_timing = "pre"
-    elif timing_raw in {"post", "after"}:
-        action_timing = "post"
-    else:
-        # 缺字段时：有 action 视为 pre（兼容旧 Brain）；无 action 为 None
-        action_timing = "pre" if action else None
-    # post 动作不应由 OT 前置；双保险（Brain 本应不下发 post action）
-    if action_timing != "pre":
-        action = None
     return display, tts, action, assistant_turn_id, action_timing
 
 

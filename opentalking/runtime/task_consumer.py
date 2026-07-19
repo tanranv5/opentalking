@@ -857,12 +857,23 @@ async def handle_worker_task(
         if not clip_id:
             log.warning("play_clip missing clip_id session=%s", sid)
             return
-        fn = getattr(runner, "play_clip", None)
+        fn = getattr(runner, "start_clip", None)
         if not callable(fn):
             log.warning("play_clip unsupported runner session=%s", sid)
             await publish_event(r, sid, "clip.ended", {"session_id": sid, "clip_id": clip_id, "played": False})
             return
-        await fn(clip_id)
+        if not fn(clip_id):
+            await publish_event(
+                r,
+                sid,
+                "clip.ended",
+                {
+                    "session_id": sid,
+                    "clip_id": clip_id,
+                    "played": False,
+                    "reason": "speech_active",
+                },
+            )
     elif cmd == "update_fasterliveportrait_config":
         update_fn = getattr(runner, "update_fasterliveportrait_runtime_config", None)
         if not callable(update_fn):

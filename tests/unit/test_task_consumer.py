@@ -1331,8 +1331,9 @@ class ClipRunner(StubRunner):
         super().__init__()
         self.clip_calls: list[str] = []
 
-    async def play_clip(self, clip_id: str) -> None:
+    def start_clip(self, clip_id: str) -> bool:
         self.clip_calls.append(clip_id)
+        return True
 
 
 @pytest.mark.asyncio

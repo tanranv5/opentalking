@@ -80,6 +80,7 @@ async def test_flashtalk_runner_direct_speak_synthesizes_text_to_uploaded_pcm(
         "default_voice": "voice-a",
         "tts_provider": "local_cosyvoice",
         "tts_model": "cosyvoice3",
+        "tts_language": None,
     }
     assert captured["tts_text"] == "开场白"
     assert np.array_equal(captured["pcm"], np.array([1, -2, 3], dtype=np.int16))

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from opentalking.pipeline.speak.cosplay_envelope import (
     parse_cosplay_envelope,
     pre_action_slice_lengths,
@@ -25,28 +27,31 @@ def test_parse_cosplay_envelope_pre_action() -> None:
     assert timing == "pre"
 
 
-def test_parse_cosplay_envelope_post_action_not_for_ot() -> None:
+def test_parse_cosplay_envelope_rejects_post_action() -> None:
     raw = (
         '{"_cosplay_display_tts":true,"display_text":"中文","tts_text":"English",'
         '"action":"N13","action_timing":"post","assistant_turn_id":"turn-2"}'
     )
-    display, tts, action, turn_id, timing = parse_cosplay_envelope(raw)
-    assert display == "中文"
-    assert tts == "English"
-    assert action is None
-    assert turn_id == "turn-2"
-    assert timing == "post"
+    with pytest.raises(ValueError, match="post action must not be sent to OpenTalking"):
+        parse_cosplay_envelope(raw)
 
 
-def test_parse_cosplay_envelope_legacy_action_defaults_to_pre() -> None:
+def test_parse_cosplay_envelope_rejects_action_without_timing() -> None:
     raw = (
         '{"_cosplay_display_tts":true,"display_text":"中文","tts_text":"English",'
         '"action":"N05","assistant_turn_id":"turn-3"}'
     )
-    _, _, action, turn_id, timing = parse_cosplay_envelope(raw)
-    assert action == "N05"
-    assert turn_id == "turn-3"
-    assert timing == "pre"
+    with pytest.raises(ValueError, match="action_timing is required"):
+        parse_cosplay_envelope(raw)
+
+
+def test_parse_cosplay_envelope_rejects_invalid_action_timing() -> None:
+    raw = (
+        '{"_cosplay_display_tts":true,"display_text":"中文","tts_text":"English",'
+        '"action":"N05","action_timing":"during","assistant_turn_id":"turn-4"}'
+    )
+    with pytest.raises(ValueError, match="invalid action_timing"):
+        parse_cosplay_envelope(raw)
 
 
 def test_parse_non_envelope_falls_back() -> None:

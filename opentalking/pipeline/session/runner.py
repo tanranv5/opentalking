@@ -40,6 +40,7 @@ from opentalking.pipeline.speak.cosplay_envelope import (
     parse_cosplay_envelope,
     pre_action_slice_lengths,
 )
+from opentalking.pipeline.speak.clip_tasks import ExternalClipTaskMixin
 from opentalking.pipeline.speak.render_pipeline import (
     iter_rendered_frames_sync,
     render_audio_chunk_sync,
@@ -248,7 +249,7 @@ class _SpeechDebugCapture:
         return out_dir
 
 
-class SessionRunner:
+class SessionRunner(ExternalClipTaskMixin):
     def __init__(
         self,
         *,
@@ -292,6 +293,7 @@ class SessionRunner:
         self.webrtc: WebRTCSession | None = None
         self.ready_event = asyncio.Event()
         self.speech_tasks: set[asyncio.Task[None]] = set()
+        self._active_clip_task: asyncio.Task[None] | None = None
         self._llm_base_url = llm_base_url
         self._llm_api_key = llm_api_key
         self._llm_model = llm_model
@@ -499,7 +501,6 @@ class SessionRunner:
                 audio_start = index * sample_count // frame_count
                 audio_end = (index + 1) * sample_count // frame_count
                 await self._audio_sink(pcm[audio_start:audio_end], sample_rate, speech_media=False)
-            await asyncio.sleep(frame_count / fps)
             played = not self._interrupt.is_set()
             log.info(
                 "pre-action done: session=%s clip_id=%s turn_id=%s frames=%d max_ms=%d played=%s",
@@ -519,6 +520,49 @@ class SessionRunner:
                 assistant_turn_id,
             )
             return False
+
+    async def play_clip(self, clip_id: str) -> bool:
+        clip_path_obj = self._resolve_clip_path(clip_id)
+        if clip_path_obj is None:
+            raise FileNotFoundError(
+                f"clip not found: session={self.session_id} avatar={self.avatar_id} clip_id={clip_id}"
+            )
+        if self.webrtc is None or self.avatar_state is None:
+            raise RuntimeError(f"runner media is not ready: session={self.session_id}")
+        clip_path = str(clip_path_obj)
+        frames = self._load_clip_video(clip_path)
+        fps = max(1.0, float(self.avatar_state.manifest.fps))
+        sample_rate = max(1, int(self.avatar_state.manifest.sample_rate))
+        total_samples = max(1, int(round(len(frames) * sample_rate / fps)))
+        pcm = self._load_clip_audio(clip_path, total_samples, sample_rate)
+        if pcm is None:
+            pcm = np.zeros(total_samples, dtype=np.int16)
+
+        async with self._speak_lock:
+            if self._closed:
+                raise RuntimeError(f"runner closed: session={self.session_id}")
+            self._interrupt.clear()
+            self._speaking = True
+            await set_session_state(self.redis, self.session_id, "speaking")
+            try:
+                for index, frame in enumerate(frames):
+                    frame_data = VideoFrameData(
+                        data=frame,
+                        width=frame.shape[1],
+                        height=frame.shape[0],
+                        timestamp_ms=index * 1000.0 / fps,
+                    )
+                    await self._video_sink(frame_data, speech_media=False)
+                    audio_start = index * total_samples // len(frames)
+                    audio_end = (index + 1) * total_samples // len(frames)
+                    await self._audio_sink(pcm[audio_start:audio_end], sample_rate, speech_media=False)
+            finally:
+                self._speaking = False
+                if not self._closed:
+                    await set_session_state(self.redis, self.session_id, "ready")
+
+        await asyncio.sleep(len(frames) / fps)
+        return not self._interrupt.is_set()
 
     @staticmethod
     async def _put_queue_sentinel(queue: asyncio.Queue[_SpeechChunkEnvelope | None]) -> None:
@@ -795,6 +839,7 @@ class SessionRunner:
         tts_language: str | None = None,
         enqueue_unix: float | None = None,
     ) -> None:
+        await self.cancel_active_clip("speech_started")
         log.info("speak start: %s (session=%s)", text[:30], self.session_id)
         try:
             await self.speak(
@@ -846,6 +891,7 @@ class SessionRunner:
         tts_language: str | None = None,
         enqueue_unix: float | None = None,
     ) -> None:
+        await self.cancel_active_clip("speech_started")
         log.info("chat start: %s (session=%s)", prompt[:30], self.session_id)
         try:
             await self.chat(
@@ -2327,6 +2373,7 @@ class SessionRunner:
                 self._active_timing = None
 
     async def interrupt(self) -> None:
+        await self.cancel_active_clip("interrupted")
         self._interrupt.set()
         tasks = [task for task in self.speech_tasks if not task.done()]
         for task in tasks:
