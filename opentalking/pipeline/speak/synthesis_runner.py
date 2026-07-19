@@ -2523,10 +2523,34 @@ class FlashTalkRunner(ExternalClipTaskMixin):
 
                         if not self._interrupt.is_set():
                             if envelope_mode:
-                                display_text, envelope_tts, action, assistant_turn_id, action_timing = (
-                                    parse_cosplay_envelope(envelope_buffer)
-                                )
+                                parsed_envelope = parse_cosplay_envelope(envelope_buffer)
+                                display_text = parsed_envelope.display_text
+                                envelope_tts = parsed_envelope.tts_text
+                                action = parsed_envelope.action
+                                assistant_turn_id = parsed_envelope.assistant_turn_id
+                                action_timing = parsed_envelope.action_timing
                                 envelope_buffer = ""
+                                if parsed_envelope.action_error:
+                                    log.error(
+                                        "Cosplay envelope action rejected: session=%s turn_id=%s error=%s",
+                                        self.session_id,
+                                        assistant_turn_id,
+                                        parsed_envelope.action_error,
+                                    )
+                                    try:
+                                        await publish_event(
+                                            self.redis,
+                                            self.session_id,
+                                            "action.error",
+                                            {
+                                                "session_id": self.session_id,
+                                                "assistant_turn_id": assistant_turn_id,
+                                                "code": "COSPLAY_ACTION_PROTOCOL_ERROR",
+                                                "message": parsed_envelope.action_error,
+                                            },
+                                        )
+                                    except Exception:
+                                        log.exception("publish action.error failed: session=%s", self.session_id)
                                 log.info(
                                     "Cosplay envelope parsed: display_chars=%d tts_chars=%d action=%s timing=%s turn_id=%s",
                                     len(display_text),
