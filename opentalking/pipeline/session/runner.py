@@ -35,6 +35,11 @@ from opentalking.providers.llm.openai_compatible.conversation import Conversatio
 from opentalking.providers.llm.openai_compatible.sentence_splitter import SentenceSplitter
 from opentalking.providers.memory.runtime import MemoryRuntime, MemoryScope
 from opentalking.runtime.bus import publish_event
+from opentalking.pipeline.speak.cosplay_envelope import (
+    COSPLAY_ENVELOPE_MARKER,
+    parse_cosplay_envelope,
+    pre_action_slice_lengths,
+)
 from opentalking.pipeline.speak.render_pipeline import (
     iter_rendered_frames_sync,
     render_audio_chunk_sync,
@@ -317,6 +322,8 @@ class SessionRunner:
         self._speech_started = False
         self._speech_media_started = False
         self._closed = False
+        self._clip_cache: dict[str, list[np.ndarray]] = {}
+        self._clip_audio_cache: dict[str, np.ndarray | None] = {}
         self._idle_task: asyncio.Task[None] | None = None
         self._rtc_sample_rate = int(os.environ.get("OPENTALKING_RTC_SAMPLE_RATE") or "0")
         self._render_chunk_ms = float(os.environ.get("OPENTALKING_RENDER_CHUNK_MS", "320.0"))
@@ -388,6 +395,130 @@ class SessionRunner:
 
     def avatar_path(self) -> Path:
         return (self.avatars_root / self.avatar_id).resolve()
+
+    def _resolve_clip_path(self, clip_id: str) -> Path | None:
+        safe_id = Path(clip_id).name
+        if safe_id != clip_id or "/" in clip_id or "\\" in clip_id or ".." in clip_id:
+            log.warning("pre-action rejected unsafe clip_id=%s session=%s", clip_id, self.session_id)
+            return None
+        avatar_clip = self.avatar_path() / "clips" / f"{safe_id}.mp4"
+        if avatar_clip.exists():
+            return avatar_clip
+        global_clip = self.avatars_root / "clips" / f"{safe_id}.mp4"
+        return global_clip if global_clip.exists() else None
+
+    def _load_clip_video(self, clip_path: str) -> list[np.ndarray]:
+        cached = self._clip_cache.get(clip_path)
+        if cached is not None:
+            return cached
+        cap = cv2.VideoCapture(clip_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open clip video: {clip_path}")
+        frames: list[np.ndarray] = []
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frames.append(np.ascontiguousarray(frame))
+        finally:
+            cap.release()
+        if not frames:
+            raise RuntimeError(f"Clip video has no frames: {clip_path}")
+        self._clip_cache[clip_path] = frames
+        return frames
+
+    def _load_clip_audio(self, clip_path: str, total_samples: int, sample_rate: int) -> np.ndarray | None:
+        if os.environ.get("OPENTALKING_CLIP_AUDIO", "1").strip().lower() in {"0", "false", "no", "off"}:
+            return None
+        if clip_path in self._clip_audio_cache:
+            cached = self._clip_audio_cache[clip_path]
+            return None if cached is None else self._fit_pcm_length(cached, total_samples)
+        try:
+            proc = subprocess.run(
+                [self._ffmpeg_bin, "-v", "error", "-i", clip_path, "-vn", "-ac", "1",
+                 "-ar", str(sample_rate), "-f", "s16le", "pipe:1"],
+                capture_output=True,
+                timeout=10,
+            )
+            pcm = np.frombuffer(proc.stdout, dtype=np.int16) if proc.returncode == 0 else None
+        except Exception:
+            log.exception("pre-action clip audio decode failed: %s", clip_path)
+            pcm = None
+        if pcm is not None and pcm.size == 0:
+            pcm = None
+        self._clip_audio_cache[clip_path] = pcm
+        return None if pcm is None else self._fit_pcm_length(pcm, total_samples)
+
+    @staticmethod
+    def _fit_pcm_length(pcm: np.ndarray, total_samples: int) -> np.ndarray:
+        if pcm.size >= total_samples:
+            return pcm[:total_samples].copy()
+        fitted = np.zeros(total_samples, dtype=np.int16)
+        fitted[: pcm.size] = pcm
+        return fitted
+
+    async def _play_pre_action(self, clip_id: str | None, assistant_turn_id: str | None) -> bool:
+        """在当前 speak 锁内播放动作前缀，不把动作媒体标记为语音开口。"""
+        max_ms = max(0, self._read_int_env("OPENTALKING_PRE_ACTION_MAX_MS", 1800))
+        if not clip_id or max_ms == 0 or self.webrtc is None or self.avatar_state is None:
+            return False
+        clip_path_obj = self._resolve_clip_path(clip_id)
+        if clip_path_obj is None:
+            log.warning(
+                "pre-action clip not found: session=%s avatar=%s clip_id=%s turn_id=%s",
+                self.session_id,
+                self.avatar_id,
+                clip_id,
+                assistant_turn_id,
+            )
+            return False
+        clip_path = str(clip_path_obj)
+        try:
+            frames = self._load_clip_video(clip_path)
+            fps = max(1.0, float(self.avatar_state.manifest.fps))
+            sample_rate = max(1, int(self.avatar_state.manifest.sample_rate))
+            frame_count, sample_count = pre_action_slice_lengths(
+                len(frames), fps, sample_rate, max_ms
+            )
+            if frame_count == 0 or sample_count == 0:
+                return False
+            pcm = self._load_clip_audio(clip_path, sample_count, sample_rate)
+            if pcm is None:
+                pcm = np.zeros(sample_count, dtype=np.int16)
+            for index, frame in enumerate(frames[:frame_count]):
+                if self._interrupt.is_set():
+                    break
+                frame_data = VideoFrameData(
+                    data=frame,
+                    width=frame.shape[1],
+                    height=frame.shape[0],
+                    timestamp_ms=index * 1000.0 / fps,
+                )
+                await self._video_sink(frame_data, speech_media=False)
+                audio_start = index * sample_count // frame_count
+                audio_end = (index + 1) * sample_count // frame_count
+                await self._audio_sink(pcm[audio_start:audio_end], sample_rate, speech_media=False)
+            await asyncio.sleep(frame_count / fps)
+            played = not self._interrupt.is_set()
+            log.info(
+                "pre-action done: session=%s clip_id=%s turn_id=%s frames=%d max_ms=%d played=%s",
+                self.session_id,
+                clip_id,
+                assistant_turn_id,
+                frame_count,
+                max_ms,
+                played,
+            )
+            return played
+        except Exception:
+            log.exception(
+                "pre-action failed: session=%s clip_id=%s turn_id=%s",
+                self.session_id,
+                clip_id,
+                assistant_turn_id,
+            )
+            return False
 
     @staticmethod
     async def _put_queue_sentinel(queue: asyncio.Queue[_SpeechChunkEnvelope | None]) -> None:
@@ -744,13 +875,14 @@ class SessionRunner:
             {"session_id": self.session_id},
         )
 
-    async def _video_sink(self, frame: VideoFrameData) -> None:
+    async def _video_sink(self, frame: VideoFrameData, *, speech_media: bool = True) -> None:
         if self.webrtc:
             self._last_speech_frame = frame
             await self.webrtc.video.put(frame)
-            await self._publish_speech_media_started()
+            if speech_media:
+                await self._publish_speech_media_started()
 
-    async def _audio_sink(self, pcm: Any, sample_rate: int) -> None:
+    async def _audio_sink(self, pcm: Any, sample_rate: int, *, speech_media: bool = True) -> None:
         if not self.webrtc:
             return
         arr = np.asarray(pcm, dtype=np.int16).reshape(-1)
@@ -764,7 +896,8 @@ class SessionRunner:
             )
         if arr.size > 0:
             await self.webrtc.audio.put_pcm(arr)
-            await self._publish_speech_media_started()
+            if speech_media:
+                await self._publish_speech_media_started()
 
     def _maybe_delay_quicktalk_audio(
         self,
@@ -1946,6 +2079,10 @@ class SessionRunner:
                 )
                 soft_punct = "，；：、,;:"
                 first_sentence_committed = False
+                envelope_mode = False
+                envelope_done = False
+                envelope_buffer = ""
+                display_response: str | None = None
 
                 def _try_commit_first_sentence() -> str | None:
                     """在没有硬标点的情况下，从 splitter 内部 buffer 里抢一段当首句。"""
@@ -1982,10 +2119,27 @@ class SessionRunner:
                                 _time.perf_counter() - llm_started_at,
                             )
                             first_token_marked = True
-                        full_response_parts.append(delta)
-                        text_delta = delta
+                        piece = strip_emoji(delta)
+                        full_response_parts.append(piece)
+                        text_delta = piece
+                        # Brain envelope 必须整包解析，避免 JSON 被分句器送入 TTS。
+                        if envelope_mode:
+                            envelope_buffer += piece
+                            continue
+                        if not envelope_done:
+                            envelope_buffer += piece
+                            probe = envelope_buffer.lstrip()
+                            if probe.startswith(COSPLAY_ENVELOPE_MARKER):
+                                envelope_mode = True
+                                envelope_done = True
+                                continue
+                            if COSPLAY_ENVELOPE_MARKER.startswith(probe) and len(probe) < 64:
+                                continue
+                            envelope_done = True
+                            text_delta = envelope_buffer
+                            envelope_buffer = ""
                         if not cosyvoice3_detection_done:
-                            cosyvoice3_pending_prefix += delta
+                            cosyvoice3_pending_prefix += text_delta
                             if cosyvoice3_separator in cosyvoice3_pending_prefix:
                                 instruction, _, rest = cosyvoice3_pending_prefix.partition(cosyvoice3_separator)
                                 instruction = instruction.strip()
@@ -2019,6 +2173,33 @@ class SessionRunner:
                                 first_sentence_committed = True
                                 await _enqueue_sentence(early)
                     if not self._interrupt.is_set():
+                        if envelope_mode:
+                            display_response, envelope_tts, action, assistant_turn_id = parse_cosplay_envelope(
+                                envelope_buffer
+                            )
+                            log.info(
+                                "Cosplay envelope parsed: display_chars=%d tts_chars=%d action=%s turn_id=%s",
+                                len(display_response),
+                                len(envelope_tts),
+                                action,
+                                assistant_turn_id,
+                            )
+                            await self._play_pre_action(action, assistant_turn_id)
+                            if cosyvoice3_separator in envelope_tts:
+                                instruction, _, envelope_tts = envelope_tts.partition(cosyvoice3_separator)
+                                instruction = instruction.strip()
+                                if instruction:
+                                    cosyvoice3_instruction_prefix = f"{instruction}{cosyvoice3_separator}"
+                            cosyvoice3_detection_done = True
+                            for sentence in splitter.feed(envelope_tts):
+                                first_sentence_committed = True
+                                await _enqueue_sentence(sentence)
+                            envelope_buffer = ""
+                        elif not envelope_done and envelope_buffer:
+                            for sentence in splitter.feed(envelope_buffer):
+                                first_sentence_committed = True
+                                await _enqueue_sentence(sentence)
+                            envelope_buffer = ""
                         if not cosyvoice3_detection_done and cosyvoice3_pending_prefix:
                             for sentence in splitter.feed(cosyvoice3_pending_prefix):
                                 first_sentence_committed = True
@@ -2088,7 +2269,7 @@ class SessionRunner:
                     self._render_chunk_audio_events.clear()
                     self._speaking = False
 
-                full_response_raw = "".join(full_response_parts).strip()
+                full_response_raw = display_response if display_response is not None else "".join(full_response_parts).strip()
                 full_response = sanitize_tts_text(full_response_raw)
                 if full_response:
                     conversation.add_assistant(full_response)

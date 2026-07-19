@@ -47,13 +47,25 @@ async function awaitSttWsReply(ws: WebSocket): Promise<{ text?: string; error?: 
     }, STT_WS_REPLY_MS);
 
     ws.onmessage = (ev) => {
+      let parsed: { type?: string; text?: string; error?: string };
+      try {
+        parsed = JSON.parse(ev.data as string) as { type?: string; text?: string; error?: string };
+      } catch {
+        settle(() => {
+          ws.onclose = null;
+          reject(new Error("服务器返回非 JSON"));
+        });
+        return;
+      }
+      // 中间事件（transcript.partial / transcript.segment_final）继续等待；
+      // 只在整段终态（transcript.final / speak.queued）或 error 时返回，
+      // 否则长语音会在第一句分句结果到达时被提前截断。
+      const t = parsed.type ?? "";
+      const isTerminal = t === "transcript.final" || t === "speak.queued" || t === "error" || typeof parsed.error === "string";
+      if (!isTerminal) return;
       settle(() => {
         ws.onclose = null;
-        try {
-          resolve(JSON.parse(ev.data as string) as { text?: string; error?: string });
-        } catch {
-          reject(new Error("服务器返回非 JSON"));
-        }
+        resolve(parsed);
       });
     };
     ws.onerror = () => settle(() => reject(new Error("WebSocket 出错")));

@@ -44,6 +44,11 @@ from opentalking.providers.rtc.aiortc.adapter import WebRTCSession
 from opentalking.providers.tts.factory import build_tts_adapter, create_tts_adapter, tts_log_profile
 from opentalking.runtime.bus import publish_event
 from opentalking.pipeline.speak.audio2video_runner import Audio2VideoRunner
+from opentalking.pipeline.speak.cosplay_envelope import (
+    COSPLAY_ENVELOPE_MARKER,
+    parse_cosplay_envelope,
+    pre_action_slice_lengths,
+)
 from opentalking.pipeline.speak.text_sanitize import sanitize_tts_text, strip_emoji
 
 log = logging.getLogger(__name__)
@@ -57,29 +62,6 @@ _TTS_OPENER_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 _TTS_OPENER_PRELOAD_TASK: asyncio.Task[None] | None = None
 _SENTINEL = object()  # unique marker for "not yet set"
 _COSYVOICE3_END_OF_PROMPT = "<|endofprompt|>"
-# Brain(cosplay) 的展示/播报分流信封：display_text 进消息事件，tts_text 进合成。
-_COSPLAY_ENVELOPE_MARKER = '{"_cosplay_display_tts"'
-
-
-def _parse_cosplay_envelope(raw: str) -> tuple[str, str]:
-    """解析 Brain 的 display/tts envelope，返回 (display_text, tts_text)。
-
-    解析失败或结构不符时两者都回退为原文，保证旧版 Brain 纯文本响应不受影响。
-    """
-    text = (raw or "").strip()
-    try:
-        data = json.loads(text)
-    except Exception:
-        return text, text
-    if not isinstance(data, dict) or data.get("_cosplay_display_tts") is not True:
-        return text, text
-    display = str(data.get("display_text") or "").strip()
-    tts = str(data.get("tts_text") or "").strip()
-    if not tts:
-        tts = display
-    if not display:
-        display = tts
-    return display, tts
 
 
 def _is_cosyvoice3_control_mode(tts_provider: str | None, tts_model: str | None) -> bool:
@@ -369,6 +351,8 @@ class FlashTalkRunner:
         self._av_ts_ms = 0.0
         self._speech_media_active = False
         self._clip_cache: dict[str, list[np.ndarray]] = {}
+        #: clip 音轨 PCM 缓存（key=clip_path）；None 表示该 clip 无音轨或解码失败（缓存住避免重复起 ffmpeg）
+        self._clip_audio_cache: dict[str, np.ndarray | None] = {}
         #: Background dynamic idle cache (closes main WS briefly); speak() must await this.
         self._dynamic_idle_prepare_task: asyncio.Task[None] | None = None
         self._recording_frame_index = 0
@@ -1294,6 +1278,49 @@ class FlashTalkRunner:
         log.info("Loaded clip video: session=%s path=%s frames=%d", self.session_id, clip_path, len(frames))
         return frames
 
+    def _load_clip_audio(self, clip_path: str, total_samples: int, sample_rate: int) -> np.ndarray | None:
+        """解码 clip 自带音轨为 mono s16le PCM（动作音效，如拍桌声）。
+
+        - 无音轨 / 解码失败 / 开关关闭 → 返回 None，调用方回退静音；
+        - 结果按 ``total_samples`` 截断或补零，保证与视频帧数严格等长（A/V 同步）。
+        开关：``OPENTALKING_CLIP_AUDIO``（默认开，设 0/false 关闭——线上音效翻车时免重传素材回滚）。
+        """
+        if os.environ.get("OPENTALKING_CLIP_AUDIO", "1").strip().lower() in {"0", "false", "no", "off"}:
+            return None
+        if clip_path in self._clip_audio_cache:
+            cached = self._clip_audio_cache[clip_path]
+            if cached is None:
+                return None
+            return self._fit_pcm_length(cached, total_samples)
+        import subprocess
+        ffmpeg = os.environ.get("OPENTALKING_FFMPEG_BIN", "ffmpeg").strip() or "ffmpeg"
+        try:
+            proc = subprocess.run(
+                [ffmpeg, "-v", "error", "-i", clip_path, "-vn", "-ac", "1",
+                 "-ar", str(sample_rate), "-f", "s16le", "pipe:1"],
+                capture_output=True, timeout=10,
+            )
+            pcm = np.frombuffer(proc.stdout, dtype=np.int16) if proc.returncode == 0 else None
+        except Exception:
+            log.exception("clip audio decode failed: %s", clip_path)
+            pcm = None
+        if pcm is not None and pcm.size == 0:
+            pcm = None
+        self._clip_audio_cache[clip_path] = pcm
+        if pcm is None:
+            return None
+        log.info("Loaded clip audio: session=%s path=%s samples=%d", self.session_id, clip_path, pcm.size)
+        return self._fit_pcm_length(pcm, total_samples)
+
+    @staticmethod
+    def _fit_pcm_length(pcm: np.ndarray, total_samples: int) -> np.ndarray:
+        """截断/补零到目标采样数，保证音频与视频帧时长严格一致。"""
+        if pcm.size >= total_samples:
+            return pcm[:total_samples].copy()
+        out = np.zeros(total_samples, dtype=np.int16)
+        out[: pcm.size] = pcm
+        return out
+
     def _load_wav2lip_reference_idle_frames(self) -> list[np.ndarray] | None:
         frame_dir = self._wav2lip_reference_frame_dir()
         if frame_dir is None:
@@ -2097,6 +2124,7 @@ class FlashTalkRunner:
             full_response = ""
             spoken_prefix = ""
             assistant_message_published = False
+            pre_action_played = False
             chunk_samples = self.flashtalk.audio_chunk_samples  # 17920
             # Queue: (pcm_chunk, subtitle_for_playback) | None. Subtitle is emitted in the
             # consumer immediately before the matching A/V is queued to WebRTC so UI tracks
@@ -2166,6 +2194,7 @@ class FlashTalkRunner:
                 # can be queued while current sentence is still being synthesised.
                 sentence_q: asyncio.Queue[str | None] = asyncio.Queue(maxsize=4)
                 trim_lead_after_opener = {"applied": False}
+                opener_emitted = False
                 cosyvoice3_instruction_prefix = ""
                 cosyvoice3_pending_prefix = ""
                 cosyvoice3_detection_done = not _is_cosyvoice3_control_mode(tts_provider, tts_model)
@@ -2232,6 +2261,15 @@ class FlashTalkRunner:
                         produced,
                         opener_text,
                     )
+
+                async def _ensure_cached_opener() -> None:
+                    nonlocal opener_emitted
+                    if opener_emitted:
+                        return
+                    opener_emitted = True
+                    t_opener0 = time.perf_counter()
+                    await _emit_cached_opener()
+                    timing["opener_ms"] = (time.perf_counter() - t_opener0) * 1000.0
 
                 async def _tts_sentence(sentence: str):
                     nonlocal audio_buffer
@@ -2407,6 +2445,7 @@ class FlashTalkRunner:
                     """Stream LLM deltas, split into sentences, push to sentence_q."""
                     nonlocal full_response, text_buffer, assistant_message_published
                     nonlocal cosyvoice3_detection_done, cosyvoice3_instruction_prefix, cosyvoice3_pending_prefix
+                    nonlocal pre_action_played
                     t_llm0 = time.perf_counter()
                     t_first_token: float | None = None
                     envelope_mode = False
@@ -2440,15 +2479,16 @@ class FlashTalkRunner:
                             if not envelope_done:
                                 envelope_buffer += piece
                                 probe = envelope_buffer.lstrip()
-                                if probe.startswith(_COSPLAY_ENVELOPE_MARKER):
+                                if probe.startswith(COSPLAY_ENVELOPE_MARKER):
                                     envelope_mode = True
                                     envelope_done = True
                                     continue
-                                if _COSPLAY_ENVELOPE_MARKER.startswith(probe) and len(probe) < 64:
+                                if COSPLAY_ENVELOPE_MARKER.startswith(probe) and len(probe) < 64:
                                     continue
                                 envelope_done = True
                                 text_delta = envelope_buffer
                                 envelope_buffer = ""
+                                await _ensure_cached_opener()
                             if not cosyvoice3_detection_done:
                                 cosyvoice3_pending_prefix += piece
                                 if _COSYVOICE3_END_OF_PROMPT in cosyvoice3_pending_prefix:
@@ -2478,13 +2518,19 @@ class FlashTalkRunner:
 
                         if not self._interrupt.is_set():
                             if envelope_mode:
-                                display_text, envelope_tts = _parse_cosplay_envelope(envelope_buffer)
+                                display_text, envelope_tts, action, assistant_turn_id = parse_cosplay_envelope(
+                                    envelope_buffer
+                                )
                                 envelope_buffer = ""
                                 log.info(
-                                    "Cosplay envelope parsed: display_chars=%d tts_chars=%d",
+                                    "Cosplay envelope parsed: display_chars=%d tts_chars=%d action=%s turn_id=%s",
                                     len(display_text),
                                     len(envelope_tts),
+                                    action,
+                                    assistant_turn_id,
                                 )
+                                pre_action_played = await self._play_pre_action(action, assistant_turn_id)
+                                await _ensure_cached_opener()
                                 if _COSYVOICE3_END_OF_PROMPT in envelope_tts:
                                     instruction, _, envelope_tts = envelope_tts.partition(
                                         _COSYVOICE3_END_OF_PROMPT
@@ -2503,6 +2549,7 @@ class FlashTalkRunner:
                                 full_response = display_text
                             elif not envelope_done and envelope_buffer:
                                 # 响应太短未完成判定：按普通文本回放。
+                                await _ensure_cached_opener()
                                 await _feed_text_delta(envelope_buffer)
                                 envelope_buffer = ""
                             if not cosyvoice3_detection_done and cosyvoice3_pending_prefix:
@@ -2550,9 +2597,6 @@ class FlashTalkRunner:
                         await sentence_q.put(None)  # signal TTS worker to stop
 
                 try:
-                    t_opener0 = time.perf_counter()
-                    await _emit_cached_opener()
-                    timing["opener_ms"] = (time.perf_counter() - t_opener0) * 1000.0
                     # Run LLM feeder and TTS worker concurrently within
                     # the producer; the TTS worker processes sentences as
                     # fast as Edge TTS can generate audio while the LLM
@@ -2627,11 +2671,13 @@ class FlashTalkRunner:
                     pacing_started = True
                     self._speech_media_active = True
                     if self.webrtc:
-                        self.webrtc.draining = True
-                        self.webrtc.clear_media_queues()
-                        self.webrtc.reset_clocks()
-                    self._av_ts_ms = 0.0
-                    self._media_clock_started = True
+                        if not pre_action_played:
+                            self.webrtc.draining = True
+                            self.webrtc.clear_media_queues()
+                            self.webrtc.reset_clocks()
+                    if not pre_action_played:
+                        self._av_ts_ms = 0.0
+                        self._media_clock_started = True
 
                 while True:
                     item = await audio_q.get()
@@ -3266,7 +3312,13 @@ class FlashTalkRunner:
                 waited, self.webrtc.video._queue.qsize(), self.webrtc.audio._queue.qsize(),
             )
 
-    async def _queue_av_chunk(self, pcm_chunk: np.ndarray, frames: list[Any]) -> None:
+    async def _queue_av_chunk(
+        self,
+        pcm_chunk: np.ndarray,
+        frames: list[Any],
+        *,
+        speech_media: bool = True,
+    ) -> None:
         """Queue generated video frames interleaved with matching audio.
 
         Each video frame is paired with a proportional slice of the audio
@@ -3281,6 +3333,8 @@ class FlashTalkRunner:
         vq_before = self.webrtc.video._queue.qsize() if self.webrtc else -1
         aq_before = self.webrtc.audio._queue.qsize() if self.webrtc else -1
         if (
+            speech_media
+            and
             t0 is not None
             and isinstance(ms, dict)
             and "first_webrtc_queue_ms" not in ms
@@ -3288,6 +3342,8 @@ class FlashTalkRunner:
             ms["first_webrtc_queue_ms"] = (time.perf_counter() - t0) * 1000.0
             first_media_this_speak = True
         if (
+            speech_media
+            and
             eu is not None
             and isinstance(ms, dict)
             and "first_frame_from_api_wall_ms" not in ms
@@ -3424,6 +3480,67 @@ class FlashTalkRunner:
             return global_clips
         return None
 
+    async def _play_pre_action(self, clip_id: str | None, assistant_turn_id: str | None) -> bool:
+        """在当前 speak 锁内播放动作片段前缀，不发布 speech.media_started。"""
+        max_ms = max(0, _env_int("OPENTALKING_PRE_ACTION_MAX_MS", 1800))
+        if not clip_id or max_ms == 0 or self.webrtc is None:
+            return False
+        clip_path_obj = self._resolve_clip_path(clip_id)
+        if clip_path_obj is None:
+            log.warning(
+                "pre-action clip not found: session=%s avatar=%s clip_id=%s turn_id=%s",
+                self.session_id,
+                self.avatar_id,
+                clip_id,
+                assistant_turn_id,
+            )
+            return False
+        clip_path = str(clip_path_obj)
+        try:
+            from opentalking.core.types.frames import VideoFrameData
+
+            frames_raw = self._load_clip_video(clip_path)
+            fps = max(1.0, float(getattr(self.flashtalk, "fps", 25) or 25))
+            sample_rate = max(1, int(getattr(self.flashtalk, "sample_rate", 16000) or 16000))
+            frame_count, sample_count = pre_action_slice_lengths(
+                len(frames_raw), fps, sample_rate, max_ms
+            )
+            if frame_count == 0 or sample_count == 0:
+                return False
+            pcm = self._load_clip_audio(clip_path, sample_count, sample_rate)
+            if pcm is None:
+                pcm = np.zeros(sample_count, dtype=np.int16)
+            frames = [
+                VideoFrameData(data=frame, width=frame.shape[1], height=frame.shape[0], timestamp_ms=0.0)
+                for frame in frames_raw[:frame_count]
+            ]
+            self._speech_media_active = True
+            self._ensure_media_clock_started()
+            await self._queue_av_chunk(pcm, frames, speech_media=False)
+            # 不等待播放完成：TTS 合成与 pre-action 播放并行，WebRTC 队列顺序天然保证
+            # 「先动作后语音」；在此 sleep 会让整条 speak 管线串行多等一段动作时长。
+            played = not self._interrupt.is_set()
+            log.info(
+                "pre-action done: session=%s clip_id=%s turn_id=%s frames=%d max_ms=%d played=%s",
+                self.session_id,
+                clip_id,
+                assistant_turn_id,
+                frame_count,
+                max_ms,
+                played,
+            )
+            return played
+        except Exception:
+            log.exception(
+                "pre-action failed: session=%s clip_id=%s turn_id=%s",
+                self.session_id,
+                clip_id,
+                assistant_turn_id,
+            )
+            return False
+        finally:
+            self._speech_media_active = False
+
     async def play_clip(self, clip_id: str) -> None:
         clip_path_obj = self._resolve_clip_path(clip_id)
         if clip_path_obj is None:
@@ -3447,7 +3564,10 @@ class FlashTalkRunner:
         fps = max(1.0, float(getattr(self.flashtalk, "fps", 25) or 25))
         sample_rate = max(1, int(getattr(self.flashtalk, "sample_rate", 16000) or 16000))
         total_samples = max(1, int(round(len(frames_raw) * sample_rate / fps)))
-        pcm = np.zeros(total_samples, dtype=np.int16)
+        # 优先使用 clip 自带音轨（动作音效，如拍桌/摔文件声）；无音轨或解码失败回退静音
+        pcm = self._load_clip_audio(clip_path, total_samples, sample_rate)
+        if pcm is None:
+            pcm = np.zeros(total_samples, dtype=np.int16)
         async with self._speak_lock:
             if self._closed:
                 await publish_event(

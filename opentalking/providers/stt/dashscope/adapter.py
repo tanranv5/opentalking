@@ -30,45 +30,78 @@ class _NoopRecognitionCallback(RecognitionCallback):
 
 
 class _StreamingTextCollector(RecognitionCallback):
-    """流式识别：汇总 ``sentence_end`` 分句；否则保留最后一次部分文本。"""
+    """流式识别文本收集器。
+
+    DashScope 流式回调中 ``result.get_sentence()`` 返回 **单个 dict**（当前句），
+    仅同步 ``Recognition.call()`` 路径才返回 list。按 SDK 的
+    ``RecognitionResult.is_sentence_end(sentence)``（``end_time`` 非空）判定句尾：
+    句尾追加进 ``_segments`` 并清空 partial，否则仅覆盖当前句 partial。
+    ``combined_text()`` = 已定稿分句 + 尾部未定稿 partial，保证长语音不丢前段/尾段。
+
+    事件协议（经 ``event_queue`` 发往 WS 前端）：
+    - ``transcript.partial``：中间结果，text 为累计全文预览
+    - ``transcript.segment_final``：单句定稿，text 为累计全文（整段未结束，is_final=False）
+    - 整段唯一终态 ``transcript.final`` 由 API 层在识别全部结束后发送，本类不发。
+    """
 
     def __init__(self, event_queue: "queue.Queue[dict] | None" = None) -> None:
         self._segments: list[str] = []
+        # 已消费句尾的 (begin_time, end_time)，防 SDK 重发同一句尾导致重复拼接。
+        # 不能按文本去重：用户可能真的连说两遍相同的话。
+        self._consumed_sentence_keys: set[tuple] = set()
         self._last_partial = ""
         self._lock = threading.Lock()
         self.error_message: str | None = None
         self._event_queue = event_queue
         self._last_emitted_partial = ""
 
+    @staticmethod
+    def _iter_sentences(result: RecognitionResult) -> list[dict]:
+        """将流式（dict）与同步（list）两种返回统一为句 dict 列表。"""
+        sentences = result.get_sentence()
+        if isinstance(sentences, dict):
+            return [sentences]
+        if isinstance(sentences, list):
+            return [s for s in sentences if isinstance(s, dict)]
+        return []
+
     def on_event(self, result: RecognitionResult) -> None:
         with self._lock:
-            pushed = False
-            sentences = result.get_sentence()
-            if isinstance(sentences, list):
-                for item in sentences:
-                    if (
-                        isinstance(item, dict)
-                        and item.get("sentence_end")
-                        and item.get("text")
-                    ):
-                        text = str(item["text"]).strip()
-                        self._segments.append(text)
-                        self._emit("transcript.final", text, True)
-                        pushed = True
-            if not pushed:
+            handled = False
+            for item in self._iter_sentences(result):
+                text = str(item.get("text") or "").strip()
+                if not text:
+                    continue
+                handled = True
+                if RecognitionResult.is_sentence_end(item):
+                    key = (item.get("begin_time"), item.get("end_time"))
+                    if key in self._consumed_sentence_keys:
+                        continue
+                    self._consumed_sentence_keys.add(key)
+                    self._segments.append(text)
+                    self._last_partial = ""
+                    self._emit("transcript.segment_final", self._merged_locked(), False)
+                else:
+                    self._last_partial = text
+                    self._emit("transcript.partial", self._merged_locked(), False)
+            if not handled:
                 t = recognition_result_to_text(result)
                 if t:
                     self._last_partial = t
-                    self._emit("transcript.partial", t, False)
+                    self._emit("transcript.partial", self._merged_locked(), False)
 
     def on_error(self, result: RecognitionResult) -> None:
-        self.error_message = getattr(result, "message", None) or str(result)
-        self._emit("error", self.error_message, True)
+        with self._lock:
+            self.error_message = getattr(result, "message", None) or str(result)
+            self._emit("error", self.error_message, True)
+
+    def _merged_locked(self) -> str:
+        """调用方须已持有 ``_lock``：已定稿分句 + 尾部 partial。"""
+        return ("".join(self._segments) + self._last_partial).strip()
 
     def combined_text(self) -> str:
         with self._lock:
-            merged = "".join(self._segments).strip()
-            return merged if merged else self._last_partial.strip()
+            return self._merged_locked()
 
     def _emit(self, event_type: str, text: str | None, is_final: bool) -> None:
         if self._event_queue is None:
@@ -76,9 +109,10 @@ class _StreamingTextCollector(RecognitionCallback):
         payload = (text or "").strip()
         if not payload:
             return
-        if not is_final and payload == self._last_emitted_partial:
-            return
-        if not is_final:
+        # 仅对 partial 做同文本去重；segment_final 即使文本与上一条 partial 相同也要发出
+        if event_type == "transcript.partial":
+            if payload == self._last_emitted_partial:
+                return
             self._last_emitted_partial = payload
         self._event_queue.put({
             "type": event_type,
