@@ -2518,15 +2518,16 @@ class FlashTalkRunner:
 
                         if not self._interrupt.is_set():
                             if envelope_mode:
-                                display_text, envelope_tts, action, assistant_turn_id = parse_cosplay_envelope(
-                                    envelope_buffer
+                                display_text, envelope_tts, action, assistant_turn_id, action_timing = (
+                                    parse_cosplay_envelope(envelope_buffer)
                                 )
                                 envelope_buffer = ""
                                 log.info(
-                                    "Cosplay envelope parsed: display_chars=%d tts_chars=%d action=%s turn_id=%s",
+                                    "Cosplay envelope parsed: display_chars=%d tts_chars=%d action=%s timing=%s turn_id=%s",
                                     len(display_text),
                                     len(envelope_tts),
                                     action,
+                                    action_timing,
                                     assistant_turn_id,
                                 )
                                 pre_action_played = await self._play_pre_action(action, assistant_turn_id)
