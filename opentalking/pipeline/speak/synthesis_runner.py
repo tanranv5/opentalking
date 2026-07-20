@@ -2559,6 +2559,14 @@ class FlashTalkRunner(ExternalClipTaskMixin):
                                     action_timing,
                                     assistant_turn_id,
                                 )
+                                # 展示/持久化一律用 display_text（中文）。
+                                # pre 整段等待期间先推弹幕，避免「演完才出字」；finally 侧靠
+                                # assistant_message_published 防重复。
+                                full_response = display_text
+                                if display_text.strip() and not assistant_message_published:
+                                    assistant_message_published = await self._publish_assistant_message(
+                                        display_text
+                                    )
                                 pre_action_played = await self._play_pre_action(action, assistant_turn_id)
                                 await _ensure_cached_opener()
                                 if _COSYVOICE3_END_OF_PROMPT in envelope_tts:
@@ -2575,8 +2583,6 @@ class FlashTalkRunner(ExternalClipTaskMixin):
                                     if self._interrupt.is_set():
                                         break
                                     await _queue_sentence_for_tts(sentence)
-                                # 展示/持久化/assistant.message 一律用 display_text（中文）。
-                                full_response = display_text
                             elif not envelope_done and envelope_buffer:
                                 # 响应太短未完成判定：按普通文本回放。
                                 await _ensure_cached_opener()
@@ -3565,11 +3571,10 @@ class FlashTalkRunner(ExternalClipTaskMixin):
             # 说前完整语义动作：默认等队列按 fps 播完再返回，后续 TTS/口型才入队，保证「先戏后词」。
             if wait_playback and frame_count > 0 and not self._interrupt.is_set():
                 duration_s = float(frame_count) / fps
-                deadline = time.perf_counter() + duration_s
-                while time.perf_counter() < deadline:
-                    if self._interrupt.is_set():
-                        break
-                    await asyncio.sleep(min(0.05, max(0.0, deadline - time.perf_counter())))
+                try:
+                    await asyncio.wait_for(self._interrupt.wait(), timeout=duration_s)
+                except asyncio.TimeoutError:
+                    pass
             played = not self._interrupt.is_set()
             log.info(
                 "pre-action done: session=%s clip_id=%s turn_id=%s frames=%d/%d max_ms=%s wait=%s played=%s",

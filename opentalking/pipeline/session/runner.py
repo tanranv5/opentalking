@@ -515,11 +515,10 @@ class SessionRunner(ExternalClipTaskMixin):
                 await self._audio_sink(pcm[audio_start:audio_end], sample_rate, speech_media=False)
             if wait_playback and frame_count > 0 and not self._interrupt.is_set():
                 duration_s = float(frame_count) / fps
-                deadline = _time.perf_counter() + duration_s
-                while _time.perf_counter() < deadline:
-                    if self._interrupt.is_set():
-                        break
-                    await asyncio.sleep(min(0.05, max(0.0, deadline - _time.perf_counter())))
+                try:
+                    await asyncio.wait_for(self._interrupt.wait(), timeout=duration_s)
+                except asyncio.TimeoutError:
+                    pass
             played = not self._interrupt.is_set()
             log.info(
                 "pre-action done: session=%s clip_id=%s turn_id=%s frames=%d/%d max_ms=%s wait=%s played=%s",

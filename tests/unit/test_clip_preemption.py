@@ -183,19 +183,23 @@ async def test_session_runner_pre_action_waits_for_clip_duration_by_default(
     async def audio_sink(_pcm: object, _rate: int, *, speech_media: bool = True) -> None:
         assert speech_media is False
 
-    sleeps: list[float] = []
+    waits: list[float] = []
 
-    async def track_sleep(delay: float) -> None:
-        sleeps.append(delay)
+    async def track_wait_for(awaitable, timeout=None):  # type: ignore[no-untyped-def]
+        waits.append(float(timeout or 0.0))
+        # drain the wait() coroutine if any
+        if hasattr(awaitable, "close"):
+            awaitable.close()
+        raise asyncio.TimeoutError
 
     runner._video_sink = video_sink  # type: ignore[method-assign]
     runner._audio_sink = audio_sink  # type: ignore[method-assign]
-    monkeypatch.setattr(session_runner_module.asyncio, "sleep", track_sleep)
+    monkeypatch.setattr(session_runner_module.asyncio, "wait_for", track_wait_for)
 
     assert await runner._play_pre_action("N01", "turn-1") is True
-    # 2 frames @ 25fps => 0.08s wait; should have slept
-    assert sleeps, "pre-action should wait for playback duration when WAIT=1"
-    assert sum(sleeps) >= 0.05
+    # 2 frames @ 25fps => 0.08s wait
+    assert waits, "pre-action should wait for playback duration when WAIT=1"
+    assert waits[0] == pytest.approx(2 / 25.0)
 
 
 @pytest.mark.asyncio
@@ -226,11 +230,11 @@ async def test_session_runner_pre_action_can_skip_wait(
     async def audio_sink(_pcm: object, _rate: int, *, speech_media: bool = True) -> None:
         assert speech_media is False
 
-    async def fail_sleep(_delay: float) -> None:
+    async def fail_wait_for(*_a, **_k):  # type: ignore[no-untyped-def]
         raise AssertionError("pre-action must not wait when WAIT=0")
 
     runner._video_sink = video_sink  # type: ignore[method-assign]
     runner._audio_sink = audio_sink  # type: ignore[method-assign]
-    monkeypatch.setattr(session_runner_module.asyncio, "sleep", fail_sleep)
+    monkeypatch.setattr(session_runner_module.asyncio, "wait_for", fail_wait_for)
 
     assert await runner._play_pre_action("N01", "turn-1") is True
