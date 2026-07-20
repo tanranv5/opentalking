@@ -3513,9 +3513,15 @@ class FlashTalkRunner(ExternalClipTaskMixin):
         return None
 
     async def _play_pre_action(self, clip_id: str | None, assistant_turn_id: str | None) -> bool:
-        """在当前 speak 锁内播放动作片段前缀，不发布 speech.media_started。"""
-        max_ms = max(0, _env_int("OPENTALKING_PRE_ACTION_MAX_MS", 1800))
-        if not clip_id or max_ms == 0 or self.webrtc is None:
+        """在 speak 锁内播放说前动作，默认整段（或 MAX_MS 截断）并等播完再返回，避免口播抢画面。
+
+        环境变量：
+        - OPENTALKING_PRE_ACTION_MAX_MS：默认 8000（覆盖约 5s 成片）；0=不截断整段；<0 关闭 pre。
+        - OPENTALKING_PRE_ACTION_WAIT：默认 1，入队后按帧时长等待再让 TTS 继续；0=旧行为（只入队不等待）。
+        """
+        max_ms = _env_int("OPENTALKING_PRE_ACTION_MAX_MS", 8000)
+        wait_playback = _env_int("OPENTALKING_PRE_ACTION_WAIT", 1) != 0
+        if not clip_id or max_ms < 0 or self.webrtc is None:
             return False
         clip_path_obj = self._resolve_clip_path(clip_id)
         if clip_path_obj is None:
@@ -3556,16 +3562,24 @@ class FlashTalkRunner(ExternalClipTaskMixin):
             self._speech_media_active = True
             self._ensure_media_clock_started()
             await self._queue_av_chunk(pcm, frames, speech_media=False)
-            # 不等待播放完成：TTS 合成与 pre-action 播放并行，WebRTC 队列顺序天然保证
-            # 「先动作后语音」；在此 sleep 会让整条 speak 管线串行多等一段动作时长。
+            # 说前完整语义动作：默认等队列按 fps 播完再返回，后续 TTS/口型才入队，保证「先戏后词」。
+            if wait_playback and frame_count > 0 and not self._interrupt.is_set():
+                duration_s = float(frame_count) / fps
+                deadline = time.perf_counter() + duration_s
+                while time.perf_counter() < deadline:
+                    if self._interrupt.is_set():
+                        break
+                    await asyncio.sleep(min(0.05, max(0.0, deadline - time.perf_counter())))
             played = not self._interrupt.is_set()
             log.info(
-                "pre-action done: session=%s clip_id=%s turn_id=%s frames=%d max_ms=%d played=%s",
+                "pre-action done: session=%s clip_id=%s turn_id=%s frames=%d/%d max_ms=%s wait=%s played=%s",
                 self.session_id,
                 clip_id,
                 assistant_turn_id,
                 frame_count,
+                len(frames_raw),
                 max_ms,
+                wait_playback,
                 played,
             )
             return played

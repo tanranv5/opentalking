@@ -461,9 +461,10 @@ class SessionRunner(ExternalClipTaskMixin):
         return fitted
 
     async def _play_pre_action(self, clip_id: str | None, assistant_turn_id: str | None) -> bool:
-        """在当前 speak 锁内播放动作前缀，不把动作媒体标记为语音开口。"""
-        max_ms = max(0, self._read_int_env("OPENTALKING_PRE_ACTION_MAX_MS", 1800))
-        if not clip_id or max_ms == 0 or self.webrtc is None or self.avatar_state is None:
+        """在 speak 锁内播放说前动作；默认覆盖完整短片并等待播完再返回。"""
+        max_ms = self._read_int_env("OPENTALKING_PRE_ACTION_MAX_MS", 8000)
+        wait_playback = self._read_int_env("OPENTALKING_PRE_ACTION_WAIT", 1) != 0
+        if not clip_id or max_ms < 0 or self.webrtc is None or self.avatar_state is None:
             return False
         clip_path_obj = self._resolve_clip_path(clip_id)
         if clip_path_obj is None:
@@ -512,14 +513,23 @@ class SessionRunner(ExternalClipTaskMixin):
                 audio_start = index * sample_count // frame_count
                 audio_end = (index + 1) * sample_count // frame_count
                 await self._audio_sink(pcm[audio_start:audio_end], sample_rate, speech_media=False)
+            if wait_playback and frame_count > 0 and not self._interrupt.is_set():
+                duration_s = float(frame_count) / fps
+                deadline = _time.perf_counter() + duration_s
+                while _time.perf_counter() < deadline:
+                    if self._interrupt.is_set():
+                        break
+                    await asyncio.sleep(min(0.05, max(0.0, deadline - _time.perf_counter())))
             played = not self._interrupt.is_set()
             log.info(
-                "pre-action done: session=%s clip_id=%s turn_id=%s frames=%d max_ms=%d played=%s",
+                "pre-action done: session=%s clip_id=%s turn_id=%s frames=%d/%d max_ms=%s wait=%s played=%s",
                 self.session_id,
                 clip_id,
                 assistant_turn_id,
                 frame_count,
+                len(frames),
                 max_ms,
+                wait_playback,
                 played,
             )
             return played

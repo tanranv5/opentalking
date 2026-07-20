@@ -155,16 +155,67 @@ async def test_flashtalk_external_clip_does_not_publish_speech_media(
 
 
 @pytest.mark.asyncio
-async def test_session_runner_pre_action_does_not_wait_for_clip_duration(
+async def test_session_runner_pre_action_waits_for_clip_duration_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = object.__new__(SessionRunner)
     runner.session_id = "session-pre-action"
     runner.avatar_id = "avatar"
-    runner.webrtc = object()
+    runner.webrtc = SimpleNamespace(
+        draining=False,
+        clear_media_queues=lambda: None,
+        reset_clocks=lambda: None,
+    )
     runner.avatar_state = SimpleNamespace(manifest=SimpleNamespace(fps=25, sample_rate=16000))
     runner._interrupt = asyncio.Event()
-    runner._read_int_env = lambda _name, _default: 1800  # type: ignore[method-assign]
+    # full clip (max_ms=0), wait on
+    runner._read_int_env = lambda name, default: {  # type: ignore[method-assign]
+        "OPENTALKING_PRE_ACTION_MAX_MS": 0,
+        "OPENTALKING_PRE_ACTION_WAIT": 1,
+    }.get(name, default)
+    runner._resolve_clip_path = lambda _clip_id: SimpleNamespace(__str__=lambda self: "/tmp/N01.mp4")  # type: ignore[method-assign]
+    runner._load_clip_video = lambda _path: [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(2)]  # type: ignore[method-assign]
+    runner._load_clip_audio = lambda _path, samples, _rate: np.zeros(samples, dtype=np.int16)  # type: ignore[method-assign]
+
+    async def video_sink(_frame: object, *, speech_media: bool = True) -> None:
+        assert speech_media is False
+
+    async def audio_sink(_pcm: object, _rate: int, *, speech_media: bool = True) -> None:
+        assert speech_media is False
+
+    sleeps: list[float] = []
+
+    async def track_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    runner._video_sink = video_sink  # type: ignore[method-assign]
+    runner._audio_sink = audio_sink  # type: ignore[method-assign]
+    monkeypatch.setattr(session_runner_module.asyncio, "sleep", track_sleep)
+
+    assert await runner._play_pre_action("N01", "turn-1") is True
+    # 2 frames @ 25fps => 0.08s wait; should have slept
+    assert sleeps, "pre-action should wait for playback duration when WAIT=1"
+    assert sum(sleeps) >= 0.05
+
+
+@pytest.mark.asyncio
+async def test_session_runner_pre_action_can_skip_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = object.__new__(SessionRunner)
+    runner.session_id = "session-pre-action-nowait"
+    runner.avatar_id = "avatar"
+    runner.webrtc = SimpleNamespace(
+        draining=False,
+        clear_media_queues=lambda: None,
+        reset_clocks=lambda: None,
+    )
+    runner.avatar_state = SimpleNamespace(manifest=SimpleNamespace(fps=25, sample_rate=16000))
+    runner._interrupt = asyncio.Event()
+    runner._read_int_env = lambda name, default: {  # type: ignore[method-assign]
+        "OPENTALKING_PRE_ACTION_MAX_MS": 1800,
+        "OPENTALKING_PRE_ACTION_WAIT": 0,
+    }.get(name, default)
     runner._resolve_clip_path = lambda _clip_id: SimpleNamespace(__str__=lambda self: "/tmp/N01.mp4")  # type: ignore[method-assign]
     runner._load_clip_video = lambda _path: [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(2)]  # type: ignore[method-assign]
     runner._load_clip_audio = lambda _path, samples, _rate: np.zeros(samples, dtype=np.int16)  # type: ignore[method-assign]
@@ -176,7 +227,7 @@ async def test_session_runner_pre_action_does_not_wait_for_clip_duration(
         assert speech_media is False
 
     async def fail_sleep(_delay: float) -> None:
-        raise AssertionError("pre-action must not wait for playback duration")
+        raise AssertionError("pre-action must not wait when WAIT=0")
 
     runner._video_sink = video_sink  # type: ignore[method-assign]
     runner._audio_sink = audio_sink  # type: ignore[method-assign]

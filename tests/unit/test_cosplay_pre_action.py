@@ -9,7 +9,12 @@ from opentalking.pipeline.speak.cosplay_envelope import (
 def test_pre_action_slice_lengths_caps_video_and_aligns_audio() -> None:
     assert pre_action_slice_lengths(125, 25.0, 16000, 1800) == (45, 28800)
     assert pre_action_slice_lengths(20, 25.0, 16000, 1800) == (20, 12800)
-    assert pre_action_slice_lengths(125, 25.0, 16000, 0) == (0, 0)
+    # max_ms=0：不截断，整段 clip
+    assert pre_action_slice_lengths(125, 25.0, 16000, 0) == (125, 80000)
+    # max_ms<0：关闭
+    assert pre_action_slice_lengths(125, 25.0, 16000, -1) == (0, 0)
+    # 默认策略档：8s 足够覆盖 5s/121 帧素材
+    assert pre_action_slice_lengths(121, 25.0, 16000, 8000) == (121, 77440)
 
 
 def test_parse_cosplay_envelope_pre_action() -> None:

@@ -75,9 +75,17 @@ def pre_action_slice_lengths(
     sample_rate: int,
     max_ms: int,
 ) -> tuple[int, int]:
-    """计算不超过 max_ms 的视频帧数与严格对齐的音频采样数。"""
-    if total_frames <= 0 or fps <= 0 or sample_rate <= 0 or max_ms <= 0:
+    """计算 pre-action 视频帧数与严格对齐的音频采样数。
+
+    max_ms > 0：截断到不超过 max_ms。
+    max_ms == 0：不截断，使用整段 clip（完整说前戏）。
+    max_ms < 0：关闭（0 帧）。
+    """
+    if total_frames <= 0 or fps <= 0 or sample_rate <= 0 or max_ms < 0:
         return 0, 0
-    frame_count = min(total_frames, max(0, int(fps * max_ms / 1000.0)))
+    if max_ms == 0:
+        frame_count = total_frames
+    else:
+        frame_count = min(total_frames, max(0, int(fps * max_ms / 1000.0)))
     sample_count = int(round(frame_count * sample_rate / fps))
     return frame_count, max(0, sample_count)
