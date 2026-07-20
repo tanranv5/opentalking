@@ -2275,6 +2275,27 @@ class SessionRunner(ExternalClipTaskMixin):
                                 action_timing,
                                 assistant_turn_id,
                             )
+                            # 与 FlashTalk 对称：pre 等待前先发中文弹幕，避免「动作+整段语音」后才出字。
+                            # 文末仍会再 publish 一次完整/打断后文本；前端按全文去重，打字机对同文不重开。
+                            early_display = (display_response or "").strip()
+                            if early_display:
+                                try:
+                                    await publish_event(
+                                        self.redis,
+                                        self.session_id,
+                                        "assistant.message",
+                                        {"session_id": self.session_id, "text": early_display},
+                                    )
+                                    log.info(
+                                        "assistant.message early (pre-action): session=%s chars=%d",
+                                        self.session_id,
+                                        len(early_display),
+                                    )
+                                except Exception:
+                                    log.exception(
+                                        "early assistant.message failed: session=%s",
+                                        self.session_id,
+                                    )
                             await self._play_pre_action(action, assistant_turn_id)
                             if cosyvoice3_separator in envelope_tts:
                                 instruction, _, envelope_tts = envelope_tts.partition(cosyvoice3_separator)
